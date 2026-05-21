@@ -38,6 +38,31 @@ def _apply_start_session_success(state: State, event: Event) -> None:
     state.pending_deleted_sp = None
 
 
+def _increment_failed_authority_try(state: State, authority: str | None) -> None:
+    if authority and authority not in {"Anybody", "Admins", "Users"}:
+        try_limit = state.pin_try_limits.get(authority, 0)
+        if try_limit > 0:
+            state.pin_tries[authority] = min(try_limit, state.pin_tries.get(authority, 0) + 1)
+
+
+def _failed_authas_authorities(state: State, event: Event) -> set[str]:
+    if event.method in {"StartSession", "Authenticate"}:
+        return set()
+
+    failed: set[str] = set()
+    pairs = _authas_pairs(event.required, event.optional, _method_raw_args(event))
+    if event.authority is not None:
+        pairs.append((event.authority, event.challenge))
+
+    for authority, credential in pairs:
+        if authority in {None, "Anybody", "Admins", "Users"} or not credential:
+            continue
+        known_pin = state.pins.get(authority)
+        if known_pin is not None and _credential_text(credential) != known_pin:
+            failed.add(authority)
+    return failed
+
+
 def _apply_get_success(state: State, event: Event) -> None:
     symbol = event.invoking_symbol
     returned = _flatten_return_values(_output_return_values(event.raw), symbol)
@@ -471,6 +496,12 @@ def _apply_reset_event(state: State, reset_type: int) -> None:
 
 
 def apply_transition(state: State, event: Event) -> None:
+    if event.kind == "host_io" and event.method == "wwn" and event.is_success:
+        wwn = _output_return_values(event.raw)
+        if wwn is not None and wwn is not False:
+            state.wwn = wwn
+        return
+
     if event.kind == "host_io" and event.method == "msid" and event.is_success:
         msid = _output_return_values(event.raw)
         if msid is not None and msid is not False:
@@ -513,20 +544,16 @@ def apply_transition(state: State, event: Event) -> None:
     if not event.is_success:
         if event.status == NOT_AUTHORIZED:
             authority = event.authority if event.method == "StartSession" else _auth_from_authenticate_event(event)
-            if authority and authority not in {"Anybody", "Admins", "Users"}:
-                try_limit = state.pin_try_limits.get(authority, 0)
-                if try_limit > 0:
-                    state.pin_tries[authority] = min(try_limit, state.pin_tries.get(authority, 0) + 1)
+            _increment_failed_authority_try(state, authority)
+        for authority in _failed_authas_authorities(state, event):
+            _increment_failed_authority_try(state, authority)
         return
 
     if event.method == "Authenticate":
         authority = _auth_from_authenticate_event(event)
         authenticated = _return_bool(event.raw)
         if authenticated is False:
-            if authority and authority not in {"Anybody", "Admins", "Users"}:
-                try_limit = state.pin_try_limits.get(authority, 0)
-                if try_limit > 0:
-                    state.pin_tries[authority] = min(try_limit, state.pin_tries.get(authority, 0) + 1)
+            _increment_failed_authority_try(state, authority)
             return
         if authority:
             state.session.authenticated.add(authority)

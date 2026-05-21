@@ -322,6 +322,15 @@ class SolverRuleTests(unittest.TestCase):
         record = start_session(ADMIN_SP, "Admins", "new")
         self.assertEqual(predict_trajectory([record]), "FAIL")
 
+    def test_start_session_rejects_msid_as_signing_authority(self):
+        trajectory = [
+            start_session(ADMIN_SP),
+            method_record("Get", "0000000B00008402", "C_PIN", return_values=[[{"3": "MSID"}]]),
+            end_session(),
+            start_session(ADMIN_SP, "MSID", "MSID"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_authenticate_accepts_plaintext_challenge_object(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP),
@@ -373,6 +382,14 @@ class SolverRuleTests(unittest.TestCase):
             method_record("Set", "0000000B00000001", "C_PIN", optional={"Values": [{"3": "newer"}]}),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_authenticate_rejects_msid_as_authority(self):
+        trajectory = [
+            start_session(ADMIN_SP),
+            method_record("Get", "0000000B00008402", "C_PIN", return_values=[[{"3": "MSID"}]]),
+            method_record("Authenticate", "0000020500000001", "SP", "SUCCESS", optional={"authAs": ("MSID", "MSID")}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
     def test_method_level_authas_authorizes_target_set(self):
         trajectory = owned_admin_context() + [
@@ -523,6 +540,32 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_set_accepts_rowvalues_alias_for_pin_update(self):
+        trajectory = [
+            start_session(ADMIN_SP),
+            method_record("Get", "0000000B00008402", "C_PIN", return_values=[[{"3": "MSID"}]]),
+            end_session(),
+            start_session(ADMIN_SP, SID, "old"),
+            method_record("Set", "0000000B00000001", "C_PIN", optional={"RowValues": [{"PIN": "new"}]}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_set_accepts_namedvalues_alias_for_range_lock(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record(
+                "Set",
+                "0000080200030001",
+                "Locking",
+                optional={"NamedValues": {"RangeStart": 0, "RangeLength": 1024, "WriteLockEnabled": 1, "WriteLocked": 1}},
+            ),
+            end_session(),
+            host_write_status("SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_raw_opal_authenticate_adds_authority(self):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP),
@@ -549,6 +592,18 @@ class SolverRuleTests(unittest.TestCase):
         trajectory = [
             start_session(ADMIN_SP),
             method_record("Get", "0000000B00008402", "C_PIN", return_values={b"PIN": "MSID"}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "MSID"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_returnvalue_alias_updates_msid_pin(self):
+        record = method_record("Get", "0000000B00008402", "C_PIN")
+        record["output"].pop("return_values", None)
+        record["output"]["returnValue"] = {"PIN": "MSID"}
+        trajectory = [
+            start_session(ADMIN_SP),
+            record,
             end_session(),
             start_session(ADMIN_SP, SID, "MSID"),
         ]
@@ -764,6 +819,67 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_tcgstorageapi_qualified_function_name_maps_to_wrapper(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "TCGstorageAPI.tcgapi.Sed.changePIN", "args": ["SID", "newer"], "kwargs": {"authAs": ("SID", "new")}},
+                "output": {"return": True},
+            },
+            start_session(ADMIN_SP, SID, "newer"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_params_alias_maps_to_args(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "changePIN", "params": ["SID", "newer"], "kwargs": {"authAs": ("SID", "new")}},
+                "output": {"return": True},
+            },
+            start_session(ADMIN_SP, SID, "newer"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_qualified_operation_name_maps_to_revert(self):
+        trajectory = [
+            {"input": {"function": "self.SED.wwn", "args": []}, "output": {"return": 0x1234}},
+            {"input": {"operation": "self.SED.revert", "args": [{"0x9999": "psid"}]}, "output": {"return": True}},
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_change_user_pin_targets_cpin_user(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            {
+                "input": {"function": "enableAuthority", "args": ["User1", True], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+            {
+                "input": {"function": "changePIN", "args": ["User1", "userpin"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+            end_session(),
+            start_session(LOCKING_SP, "User1", "userpin"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_set_min_pin_length_targets_cpin_user(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            {
+                "input": {"function": "enableAuthority", "args": ["User1", True], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+            {
+                "input": {"function": "setMinPINLength", "args": ["User1", 6], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+            {
+                "input": {"function": "changePIN", "args": ["User1", "abc"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_tcgstorageapi_high_level_change_pin_wrong_auth_true_is_invalid(self):
         trajectory = owned_admin_context() + [
             {
@@ -828,6 +944,33 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_tcgstorageapi_high_level_get_authority_false_is_disabled_value(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "getAuthority", "args": ["User1"], "kwargs": {"obj": "Authority_User1", "authAs": ("Admin1", "new")}},
+                "output": {"return": False},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_readdata_none_is_empty_datastore_success(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "readData", "args": ["Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": None},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_get_psk_entry_none_is_empty_get_success(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "getPskEntry", "args": [1], "kwargs": {"authAs": ("SID", "new")}},
+                "output": {"return": None},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_tcgstorageapi_high_level_set_port_maps_to_adminsp_set(self):
         trajectory = owned_admin_context() + [
             {
@@ -843,6 +986,53 @@ class SolverRuleTests(unittest.TestCase):
                 "input": {"function": "tperSign", "args": ["A" * 257]},
                 "output": {"return": b"signature"},
             }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_tpersign_rejects_wrong_explicit_authas_success(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "tperSign", "args": [b"payload"], "kwargs": {"authAs": ("SID", "wrong")}},
+                "output": {"return": b"signature"},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_tpersign_accepts_wrong_explicit_authas_failure(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "tperSign", "args": [b"payload"], "kwargs": {"authAs": ("SID", "wrong")}},
+                "output": {"return": False},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_tpersign_rejects_locked_out_explicit_authas_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", optional={"Values": [{"5": 1}]}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "wrong", "NOT_AUTHORIZED"),
+            {
+                "input": {"function": "tperSign", "args": [b"payload"], "kwargs": {"authAs": ("SID", "new")}},
+                "output": {"return": b"signature"},
+            },
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_failed_method_authas_counts_toward_try_limit(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", optional={"Values": [{"5": 1}]}),
+            end_session(),
+            {
+                "input": {"function": "tperSign", "args": [b"payload"], "kwargs": {"authAs": ("SID", "wrong")}},
+                "output": {"return": False},
+            },
+            {
+                "input": {"function": "tperSign", "args": [b"payload"], "kwargs": {"authAs": ("SID", "new")}},
+                "output": {"return": b"signature"},
+            },
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
@@ -882,6 +1072,15 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_tcgstorageapi_high_level_tpersign_cert_get_rejects_wrong_explicit_authas_success(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "get_tperSign_cert", "kwargs": {"authAs": ("SID", "wrong")}},
+                "output": {"return": bytearray(b"cert")},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_tcgstorageapi_high_level_writeaccess_allows_user_datastore_write(self):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP, ADMIN1, "new"),
@@ -899,6 +1098,26 @@ class SolverRuleTests(unittest.TestCase):
             },
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_writeaccess_rejects_user_without_number(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            {
+                "input": {"function": "writeaccess", "args": ["User", 1], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_enable_range_access_rejects_user_without_number(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            {
+                "input": {"function": "enable_range_access", "args": ["Band1", "User", "Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
     def test_tcgstorageapi_high_level_set_psk_entry_accepts_sid_auth(self):
         trajectory = owned_admin_context() + [
@@ -926,6 +1145,19 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_tcgstorageapi_high_level_set_psk_entry_requires_cipher_suite(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {
+                    "function": "setPskEntry",
+                    "args": [0],
+                    "kwargs": {"authAs": ("SID", "new"), "Enabled": False, "PSK": b"secret"},
+                },
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_tcgstorageapi_high_level_set_psk_entry_rejects_wrong_second_auth(self):
         trajectory = activated_locking_context() + [
             {
@@ -936,6 +1168,23 @@ class SolverRuleTests(unittest.TestCase):
                 },
                 "output": {"return": True},
             }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_set_psk_entry_rejects_locked_out_second_auth(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000000B00010001", "C_PIN_Admin1", optional={"Values": [{"5": 1}]}),
+            end_session(),
+            start_session(LOCKING_SP, ADMIN1, "wrong", "NOT_AUTHORIZED"),
+            {
+                "input": {
+                    "function": "setPskEntry",
+                    "args": [0],
+                    "kwargs": {"authAs": [("SID", "new"), ("Admin1", "new")], "Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
+                },
+                "output": {"return": True},
+            },
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
@@ -963,10 +1212,83 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_tcgstorageapi_high_level_getrange_empty_return_is_success(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "getRange", "args": [1, "Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": None},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_getrange_tuple_updates_range_state(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "getRange", "args": [1, "Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {
+                    "return": [
+                        {"RangeStart": 0, "RangeLength": 1024, "WriteLockEnabled": 1, "WriteLocked": 1},
+                        True,
+                    ]
+                },
+            },
+            host_write_status("SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_result_pass_maps_to_success(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "getRange", "args": [1, "Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"result": "pass"},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_operation_field_maps_high_level_revert(self):
+        trajectory = [
+            {"input": {"operation": "wwn", "args": []}, "output": {"return": 0x1234}},
+            {"input": {"operation": "revert", "args": [{"0x9999": "psid"}]}, "output": {"return": True}},
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_revertdrive_alias_maps_to_revert(self):
+        trajectory = [
+            {"input": {"function": "wwn", "args": []}, "output": {"return": 0x1234}},
+            {"input": {"operation": "revertDrive", "kwargs": {"psid": {"0x9999": "psid"}}}, "output": {"return": True}},
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_camelcase_getmek_alias_maps_to_get_mek(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "getMEK", "args": [1, "Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": {"K_AES_256_Range1_Key_UID": b"\x00\x00\x08\x06\x00\x03\x00\x01"}},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_camelcase_enable_range_access_alias(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {"function": "enableRangeAccess", "args": ["Band1", "User", "Admin1"], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_tcgstorageapi_high_level_tcgreset_closes_session_without_factory_reset(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP, SID, "new"),
             {"input": {"function": "tcgReset", "args": []}, "output": {"return": True}},
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_tcg_reset_alias_closes_session(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            {"input": {"function": "tcg_reset", "args": []}, "output": {"return": True}},
             start_session(ADMIN_SP, SID, "new"),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
@@ -993,6 +1315,27 @@ class SolverRuleTests(unittest.TestCase):
                 "input": {"function": "usePsk", "args": ["TLS_PSK_Key1", "TLS_AES_128_GCM_SHA256", b"psk"]},
                 "output": {"return": None},
             }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_revert_accepts_psid_map_for_observed_wwn(self):
+        trajectory = [
+            {"input": {"function": "wwn", "args": []}, "output": {"return": 0x1234}},
+            {"input": {"function": "revert", "args": [{"0x1234": "psid"}]}, "output": {"return": True}},
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_revert_rejects_success_for_wrong_psid_map_wwn(self):
+        trajectory = [
+            {"input": {"function": "wwn", "args": []}, "output": {"return": 0x1234}},
+            {"input": {"function": "revert", "args": [{"0x9999": "psid"}]}, "output": {"return": True}},
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_revert_accepts_false_for_wrong_psid_map_wwn(self):
+        trajectory = [
+            {"input": {"function": "wwn", "args": []}, "output": {"return": 0x1234}},
+            {"input": {"function": "revert", "args": [{"0x9999": "psid"}]}, "output": {"return": False}},
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
@@ -1066,6 +1409,24 @@ class SolverRuleTests(unittest.TestCase):
             start_session(ADMIN_SP, SID, "new"),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_cpin_name_without_underscore_updates_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            method_record("Set", "", "C PIN SID", optional={"PIN": "new"}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_authority_name_without_underscore_updates_enabled_state(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "", "Authority User1", optional={"Enabled": 0}),
+            end_session(),
+            start_session(LOCKING_SP, "User1", "userpin"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
     def test_numeric_tcg_status_code_is_normalized(self):
         record = method_record("Set", "0000000B00000001", "C_PIN", 1, optional={"Values": [{"3": "new"}]})
@@ -1963,6 +2324,19 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_genkey_key_name_without_underscore_invalidates_range_media(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000080200030001", "Locking", optional={"Values": [{"3": 0}, {"4": "00020000"}]}),
+            end_session(),
+            host_write("8E"),
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("GenKey", "", "K AES 256 Range1 Key", "SUCCESS"),
+            end_session(),
+            host_read("8E"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_genkey_requires_write_session(self):
         trajectory = activated_locking_context() + [
             raw_method_record("StartSession", "00000000000000FF", "Session Manager UID", args=[100, LOCKING_SP_INT, 0]),
@@ -2049,10 +2423,24 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_host_read_pattern_that_looks_like_status_code_is_data(self):
+        trajectory = activated_locking_context() + [
+            host_write("13", lba="80 ~ 87"),
+            host_read("Pattern 13", lba="80 ~ 87"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_top_level_host_io_schema_tracks_lba_pattern(self):
         trajectory = activated_locking_context() + [
             host_write_top_level("8E"),
             host_read_top_level("8E"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_nested_operation_host_io_schema_tracks_lba_pattern(self):
+        trajectory = activated_locking_context() + [
+            {"input": {"operation": "Write", "args": {"LBA": "80 ~ 87", "pattern": "8E"}}, "output": {"status": "SUCCESS"}},
+            {"input": {"operation": "Read", "args": {"LBA": "80 ~ 87"}}, "output": {"data": "8E"}},
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
@@ -2080,6 +2468,20 @@ class SolverRuleTests(unittest.TestCase):
                 "0000080200030001",
                 "Locking",
                 optional={"RangeStart": 80, "RangeLength": 8, "WriteLockEnabled": 1, "WriteLocked": 1},
+            ),
+            end_session(),
+            host_write_status("SUCCESS", lba="80 ~ 87"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_lockingrange_name_variant_updates_range_state(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record(
+                "Set",
+                "",
+                "LockingRange1",
+                optional={"Values": [{"RangeStart": 80}, {"RangeLength": 8}, {"WriteLockEnabled": 1}, {"WriteLocked": 1}]},
             ),
             end_session(),
             host_write_status("SUCCESS", lba="80 ~ 87"),
@@ -3050,6 +3452,19 @@ class SolverRuleTests(unittest.TestCase):
                 "Set",
                 "",
                 "TLS_PSK_Key0",
+                "SUCCESS",
+                optional={"Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tls_psk_name_without_underscore_is_recognized(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "Set",
+                "",
+                "TLS PSK Key 0",
                 "SUCCESS",
                 optional={"Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
             ),

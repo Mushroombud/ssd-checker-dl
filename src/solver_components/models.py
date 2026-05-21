@@ -118,6 +118,7 @@ class State:
     deleted_method_associations: set[tuple[str, str]] = field(default_factory=set)
     mbr: dict[str, Any] = field(default_factory=dict)
     lba_patterns: dict[tuple[int, int], tuple[str, int, int]] = field(default_factory=dict)
+    wwn: Any = None
 
 
 __all__ = [

@@ -171,6 +171,8 @@ def _authas_default_authority_candidates(state: State, event: Event, credential:
                 continue
             if not _authority_is_enabled(state, state.session.sp, authority):
                 continue
+            if _authority_locked_out(state, authority):
+                continue
             if _authority_relevant_for_target(state, event, authority):
                 _add_authority_candidate(candidates, authority)
     if candidates:
@@ -208,6 +210,8 @@ def _apply_invocation_auth_for_target(state: State, event: Event) -> tuple[str |
                 continue
             if not _authority_is_enabled(state, state.session.sp, resolved_authority):
                 continue
+            if _authority_locked_out(state, resolved_authority):
+                continue
             if not credential:
                 continue
             known_pin = state.pins.get(resolved_authority)
@@ -220,6 +224,24 @@ def _apply_invocation_auth_for_target(state: State, event: Event) -> tuple[str |
     return None, False
 
 
+def _explicit_authas_known_wrong(state: State, event: Event) -> bool:
+    if event.method in {"StartSession", "Authenticate"} or not state.session.open:
+        return False
+    for authority, credential in _authas_pairs(event.required, event.optional, _method_raw_args(event)):
+        if authority in {None, "Anybody", "Admins", "Users"} or not credential:
+            continue
+        if _has_authority(state, authority):
+            continue
+        if not _authority_allowed_for_target_method(state, event, authority):
+            continue
+        if _authority_locked_out(state, authority):
+            return True
+        known_pin = state.pins.get(authority)
+        if known_pin is not None and _credential_text(credential) != known_pin:
+            return True
+    return False
+
+
 def judge_target(state: State, event: Event) -> str:
     working_state = state
     if event.implicit_session and not state.session.open and event.kind == "tcg_method":
@@ -228,6 +250,9 @@ def judge_target(state: State, event: Event) -> str:
     added_authority, credential_unknown = _apply_invocation_auth_for_target(working_state, event)
     try:
         expected = expected_status(working_state, event)
+        if _explicit_authas_known_wrong(working_state, event):
+            expected.allowed_statuses = {NOT_AUTHORIZED, FAIL}
+            expected.forbidden_statuses = set(expected.forbidden_statuses) | {SUCCESS}
         if added_authority is not None and credential_unknown:
             expected.allowed_statuses = set(expected.allowed_statuses) | {NOT_AUTHORIZED}
         return compare_expected_actual(expected, event)

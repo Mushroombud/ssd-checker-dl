@@ -314,6 +314,12 @@ def _normalize_name(name: Any) -> str:
     if match:
         range_id = int(match.group(1))
         return "Locking_GlobalRange" if range_id == 0 else f"Locking_Range{range_id}"
+    if re.fullmatch(r"(?:Locking_?)?GlobalRange", compact, flags=re.IGNORECASE):
+        return "Locking_GlobalRange"
+    match = re.fullmatch(r"(?:Locking_?)?Range(\d+)", compact, flags=re.IGNORECASE)
+    if match:
+        range_id = int(match.group(1))
+        return "Locking_GlobalRange" if range_id == 0 else f"Locking_Range{range_id}"
     match = re.fullmatch(r"ACE_Locking_Range(\d+)_Set_RdLocked", compact, flags=re.IGNORECASE)
     if match:
         return f"ACE_0003{0xE000 + int(match.group(1)):04X}"
@@ -327,6 +333,12 @@ def _normalize_name(name: Any) -> str:
     if match:
         return f"K_AES_{match.group(1)}_Range{int(match.group(2))}_Key"
     match = re.fullmatch(r"K_AES_(128|256)_GlobalRange_Key(?:_UID)?", compact, flags=re.IGNORECASE)
+    if match:
+        return f"K_AES_{match.group(1)}_GlobalRange_Key"
+    match = re.fullmatch(r"K_?AES_?(128|256)_?Range(\d+)_?Key(?:_?UID)?", compact, flags=re.IGNORECASE)
+    if match:
+        return f"K_AES_{match.group(1)}_Range{int(match.group(2))}_Key"
+    match = re.fullmatch(r"K_?AES_?(128|256)_?GlobalRange_?Key(?:_?UID)?", compact, flags=re.IGNORECASE)
     if match:
         return f"K_AES_{match.group(1)}_GlobalRange_Key"
     match = re.fullmatch(r"Port(\d+)", compact, flags=re.IGNORECASE)
@@ -347,6 +359,33 @@ def _normalize_name(name: Any) -> str:
         return "_CertData_TPerSign"
     if key == "_CERTDATA_TPERATTESTATION":
         return "_CertData_TPerAttestation"
+    match = re.fullmatch(r"C_?PIN_?(SID|MSID|EraseMaster)", compact, flags=re.IGNORECASE)
+    if match:
+        suffix = match.group(1)
+        if suffix.upper() == "SID":
+            return "C_PIN_SID"
+        if suffix.upper() == "MSID":
+            return "C_PIN_MSID"
+        return "C_PIN_EraseMaster"
+    match = re.fullmatch(r"C_?PIN_?(Admin|User|BandMaster)(\d+)", compact, flags=re.IGNORECASE)
+    if match:
+        family = match.group(1).title()
+        if family == "Bandmaster":
+            family = "BandMaster"
+        return f"C_PIN_{family}{int(match.group(2))}"
+    match = re.fullmatch(r"Authority_?(SID|MSID|PSID|EraseMaster|Admins|Users|Makers)", compact, flags=re.IGNORECASE)
+    if match:
+        authority = _authority_by_name(match.group(1))
+        return f"Authority_{authority}" if authority is not None else compact
+    match = re.fullmatch(r"Authority_?(Admin|User|BandMaster)(\d+)", compact, flags=re.IGNORECASE)
+    if match:
+        family = match.group(1).title()
+        if family == "Bandmaster":
+            family = "BandMaster"
+        return f"Authority_{family}{int(match.group(2))}"
+    match = re.fullmatch(r"TLS_?PSK_?Key(\d+)", compact, flags=re.IGNORECASE)
+    if match:
+        return f"TLS_PSK_Key{int(match.group(1))}"
     match = re.fullmatch(r"BandMaster(\d+)", compact, flags=re.IGNORECASE)
     if match:
         return f"C_PIN_BandMaster{int(match.group(1))}"
@@ -511,6 +550,8 @@ def _method_ref_name(value: Any) -> str | None:
 def _normalize_status(value: Any) -> str | None:
     if value is None:
         return None
+    if isinstance(value, (dict, list, tuple, set)):
+        return None
     if isinstance(value, (bytes, bytearray)):
         raw = bytes(value)
         if len(raw) <= 8 and any(byte < 0x20 or byte > 0x7E for byte in raw):
@@ -593,7 +634,7 @@ def _normalize_status(value: Any) -> str | None:
             if stripped in aliases:
                 return aliases[stripped]
     for alias, normalized in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        if alias and alias != "0" and alias in key:
+        if alias and alias != "0" and not re.fullmatch(r"[0-9A-F]+", alias) and alias in key:
             return normalized
     return aliases.get(key, key)
 
@@ -893,12 +934,21 @@ def _invoke_kwargs(inp: dict[str, Any]) -> dict[str, Any]:
 
 
 def _function_name(inp: dict[str, Any]) -> str:
-    value = _mapping_value(inp, "function", "Function", "func", "Func", "call", "Call", "api", "API")
-    return re.sub(r"[^A-Za-z0-9_]", "", _as_text(value or "")).lower()
+    value = _mapping_value(inp, "function", "Function", "func", "Func", "call", "Call", "api", "API", "operation", "Operation")
+    text = _as_text(value or "").strip()
+    if re.search(r"[.:/\\]", text):
+        parts = [part for part in re.split(r"[.:/\\]+", text) if part]
+        if parts:
+            text = parts[-1]
+    return re.sub(r"[^A-Za-z0-9_]", "", text).lower()
+
+
+def _function_alias(name: str) -> str:
+    return name.replace("_", "")
 
 
 def _function_args(inp: dict[str, Any]) -> list[Any]:
-    value = _mapping_value(inp, "args", "Args", "arguments", "Arguments")
+    value = _mapping_value(inp, "args", "Args", "arguments", "Arguments", "params", "Params", "parameters", "Parameters")
     if isinstance(value, tuple):
         return list(value)
     return list(value) if isinstance(value, list) else []
@@ -911,8 +961,13 @@ def _function_kwargs(inp: dict[str, Any]) -> dict[str, Any]:
         "func",
         "call",
         "api",
+        "operation",
+        "type",
+        "method",
         "args",
         "arguments",
+        "params",
+        "parameters",
         "kwargs",
         "kw",
         "named",
@@ -937,8 +992,18 @@ def _arg_or_kw(args: list[Any], kwargs: dict[str, Any], index: int, *names: str)
     return _mapping_value(kwargs, *names)
 
 
+def _high_level_return_value(out: dict[str, Any]) -> tuple[bool, Any]:
+    found_return, raw_return = _dict_lookup(out, "return", "Return", "returns", "Returns")
+    if found_return:
+        return True, raw_return
+    output_args = _mapping_section(out, "args", "Args")
+    return _dict_lookup(output_args, "return", "Return", "returns", "Returns")
+
+
 def _high_level_status(raw: dict[str, Any], out: dict[str, Any], inp: dict[str, Any]) -> str | None:
     explicit = _normalize_status(_output_status_value(out, inp))
+    if explicit == "PASS":
+        return SUCCESS
     if explicit in {SUCCESS, NOT_AUTHORIZED, INVALID_PARAMETER, INSUFFICIENT_SPACE, INSUFFICIENT_ROWS, FAIL}:
         return explicit
     returned = _return_bool(raw)
@@ -946,10 +1011,7 @@ def _high_level_status(raw: dict[str, Any], out: dict[str, Any], inp: dict[str, 
         return SUCCESS
     if returned is False:
         return FAIL
-    found_return, raw_return = _dict_lookup(out, "return", "Return", "returns", "Returns")
-    if not found_return:
-        output_args = _mapping_section(out, "args", "Args")
-        found_return, raw_return = _dict_lookup(output_args, "return", "Return", "returns", "Returns")
+    found_return, raw_return = _high_level_return_value(out)
     if found_return and raw_return is None:
         return FAIL
     if found_return and raw_return is not False:
@@ -959,13 +1021,38 @@ def _high_level_status(raw: dict[str, Any], out: dict[str, Any], inp: dict[str, 
 
 def _high_level_event(raw: dict[str, Any], inp: dict[str, Any], out: dict[str, Any]) -> Event | None:
     function_name = _function_name(inp)
+    function_alias = _function_alias(function_name)
     args = _function_args(inp)
     kwargs = _function_kwargs(inp)
     status = _high_level_status(raw, out, inp)
+    found_return, raw_return = _high_level_return_value(out)
+    if (
+        found_return
+        and _normalize_status(_output_status_value(out, inp)) not in {SUCCESS, NOT_AUTHORIZED, INVALID_PARAMETER, INSUFFICIENT_SPACE, INSUFFICIENT_ROWS, FAIL}
+        and (
+            (function_alias == "getauthority" and raw_return is False)
+            or (function_alias in {"getrange", "getport", "getpskentry", "readdata"} and raw_return is None)
+        )
+    ):
+        status = SUCCESS
 
     def authas(default_auth: Any = None) -> Any:
         value = _arg_or_kw(args, kwargs, 2, "authAs", "AuthAs")
         return value if value is not None else default_auth
+
+    def cpin_target(auth: Any, explicit_obj: Any = None) -> Any:
+        if explicit_obj is not None:
+            return explicit_obj
+        authority = _authority_from_value(auth)
+        if authority == "SID":
+            return "C_PIN_SID"
+        if authority == "MSID":
+            return "C_PIN_MSID"
+        if authority == "EraseMaster":
+            return "C_PIN_EraseMaster"
+        if authority and re.fullmatch(r"(Admin|User|BandMaster)\d+", authority):
+            return f"C_PIN_{authority}"
+        return auth
 
     def build(
         method: str,
@@ -997,21 +1084,21 @@ def _high_level_event(raw: dict[str, Any], inp: dict[str, Any], out: dict[str, A
             implicit_session=True,
         )
 
-    if function_name == "changepin":
+    if function_alias == "changepin":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth", "authority", "Authority")
         pin = _arg_or_kw(args, kwargs, 1, "pin", "PIN")
         auth_as = authas(auth)
-        target = _arg_or_kw(args, kwargs, 3, "obj", "object", "Object") or auth
+        target = cpin_target(auth, _arg_or_kw(args, kwargs, 3, "obj", "object", "Object"))
         return build("Set", target, optional={"PIN": pin, "authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "setminpinlength":
+    if function_alias == "setminpinlength":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth", "authority", "Authority")
         length = _arg_or_kw(args, kwargs, 1, "len", "length", "Length", "_MinPINLength")
         auth_as = authas(auth)
-        target = _arg_or_kw(args, kwargs, 3, "obj", "object", "Object") or auth
+        target = cpin_target(auth, _arg_or_kw(args, kwargs, 3, "obj", "object", "Object"))
         return build("Set", target, optional={"_MinPINLength": length, "authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "setrange":
+    if function_alias == "setrange":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth")
         range_no = _arg_or_kw(args, kwargs, 1, "rangeNo", "range", "Range", "range_no")
         auth_as = authas(auth)
@@ -1019,87 +1106,96 @@ def _high_level_event(raw: dict[str, Any], inp: dict[str, Any], out: dict[str, A
         optional["authAs"] = auth_as
         return build("Set", f"Band{_parse_int(range_no) or range_no}", optional=optional, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "getrange":
+    if function_alias == "getrange":
         range_no = _arg_or_kw(args, kwargs, 0, "rangeNo", "range", "Range", "range_no")
         auth = _arg_or_kw(args, kwargs, 1, "auth", "Auth")
         auth_as = authas(auth)
         return build("Get", f"Band{_parse_int(range_no) or range_no}", optional={"authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "enableauthority":
+    if function_alias == "enableauthority":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth", "authority", "Authority")
         enable = _arg_or_kw(args, kwargs, 1, "enable", "Enabled")
         target = _arg_or_kw(args, kwargs, 2, "obj", "object", "Object") or auth
         auth_as = _arg_or_kw(args, kwargs, 3, "authAs", "AuthAs") or auth
         return build("Set", target, optional={"Enabled": enable, "authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "setport":
+    if function_alias == "setport":
         port = _arg_or_kw(args, kwargs, 0, "port", "uid", "UID")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or "SID"
         optional = {key: value for key, value in kwargs.items() if re.sub(r"[^A-Za-z0-9_]", "", _as_text(key)).lower() not in {"port", "uid", "authas"}}
         optional["authAs"] = auth_as
         return build("Set", port, optional=optional, sp_value="AdminSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "random":
+    if function_alias == "random":
         count = _arg_or_kw(args, kwargs, 0, "count", "Count")
         return build("Random", "ThisSP", raw_args=count if count is not None else 32, sp_value="AdminSP")
 
-    if function_name == "activate":
+    if function_alias == "activate":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or auth
         return build("Activate", "LockingSP", optional={"authAs": auth_as}, sp_value="AdminSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "erase":
+    if function_alias == "erase":
         range_no = _arg_or_kw(args, kwargs, 0, "rangeNo", "range", "Range", "range_no")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or "EraseMaster"
         return build("Erase", f"Band{_parse_int(range_no) or range_no}", optional={"authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "gen_key":
+    if function_alias == "genkey":
         target = _arg_or_kw(args, kwargs, 0, "range_key", "rangeKey", "key", "Key")
         auth = _arg_or_kw(args, kwargs, 1, "auth", "Auth")
         auth_as = authas(auth)
         return build("GenKey", target, optional={"authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "revert":
+    if function_alias in {"revert", "revertdrive"}:
         psid = _arg_or_kw(args, kwargs, 0, "psid", "PSID")
-        return build("RevertSP", "ThisSP", optional={"authAs": ("PSID", psid)}, sp_value="AdminSP", auth_value=("PSID", psid), challenge=psid)
+        optional = {"authAs": ("PSID", psid)}
+        if not isinstance(psid, str):
+            optional["__PSIDCredentialMap"] = psid
+        return build("RevertSP", "ThisSP", optional=optional, sp_value="AdminSP", auth_value=("PSID", psid), challenge=psid)
 
-    if function_name == "revert_lockingsp":
+    if function_alias == "revertlockingsp":
         cred = _arg_or_kw(args, kwargs, 0, "cred", "credential", "pin", "PIN")
         return build("RevertSP", "ThisSP", optional={"authAs": ("Admin1", cred)}, sp_value="LockingSP", auth_value=("Admin1", cred), challenge=cred)
 
-    if function_name == "tpersign":
+    if function_alias == "tpersign":
         payload = _arg_or_kw(args, kwargs, 0, "dataInput", "Data", "data", "Input")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or "Anybody"
         return build("Sign", "TPerSign", raw_args=(payload,), optional={"authAs": auth_as, "Data": payload}, sp_value="AdminSP", auth_value=auth_as)
 
-    if function_name == "writedata":
+    if function_alias == "writedata":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth")
         data = _arg_or_kw(args, kwargs, 1, "data", "Data", "payload", "Payload")
         auth_as = authas(auth)
         return build("Set", "DataStore", raw_args=(("startRow", 0), ("Bytes", data)), optional={"authAs": auth_as, "Bytes": data}, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "readdata":
+    if function_alias == "readdata":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or auth
         return build("Get", "DataStore", raw_args=(("startRow", 0),), optional={"authAs": auth_as}, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "enable_range_access":
+    if function_alias == "enablerangeaccess":
         object_id = _arg_or_kw(args, kwargs, 0, "objectId", "objectID", "ObjectID", "object")
         user = _arg_or_kw(args, kwargs, 1, "user", "User")
         auth = _arg_or_kw(args, kwargs, 2, "auth", "Auth")
         auth_as = _arg_or_kw(args, kwargs, 3, "authAs", "AuthAs") or auth
         raw_expr = (1, [(ACE_BOOLEAN_EXPR_COLUMN, [user])])
-        return build("Set", object_id, raw_args=raw_expr, optional={"authAs": auth_as}, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
+        optional = {"authAs": auth_as}
+        if not re.search(r"\d+", _as_text(user or "")):
+            optional["__InvalidTcgApiUserArgument"] = True
+        return build("Set", object_id, raw_args=raw_expr, optional=optional, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name in {"writeaccess", "readaccess"}:
+    if function_alias in {"writeaccess", "readaccess"}:
         user = _arg_or_kw(args, kwargs, 0, "user", "User")
         table_no = _arg_or_kw(args, kwargs, 1, "tableno", "tableNo", "table", "Table")
         auth_as = _arg_or_kw(args, kwargs, 2, "authAs", "AuthAs") or "Admin1"
-        operation = "Set" if function_name == "writeaccess" else "Get"
+        operation = "Set" if function_alias == "writeaccess" else "Get"
         raw_expr = (1, [(ACE_BOOLEAN_EXPR_COLUMN, [user])])
-        return build("Set", f"ACE_DataStore{_parse_int(table_no) or table_no}_{operation}_All", raw_args=raw_expr, optional={"authAs": auth_as}, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
+        optional = {"authAs": auth_as}
+        if not re.search(r"\d+", _as_text(user or "")):
+            optional["__InvalidTcgApiUserArgument"] = True
+        return build("Set", f"ACE_DataStore{_parse_int(table_no) or table_no}_{operation}_All", raw_args=raw_expr, optional=optional, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "firmware_attestation":
+    if function_alias == "firmwareattestation":
         nonce = _arg_or_kw(args, kwargs, 0, "assessor_nonce", "assessorNonce", "Nonce", "Data")
         sub_name = _arg_or_kw(args, kwargs, 1, "sub_name", "subName", "RTRID")
         assessor_id = _arg_or_kw(args, kwargs, 2, "assessor_ID", "assessorID", "AssessorID")
@@ -1110,47 +1206,50 @@ def _high_level_event(raw: dict[str, Any], inp: dict[str, Any], out: dict[str, A
             raw_args.append(("AssessorID", assessor_id))
         return build("FirmwareAttestation", "TperAttestation", raw_args=raw_args, optional={"Data": nonce}, sp_value="AdminSP", auth_value="Anybody")
 
-    if function_name == "get_tperattestation_cert":
+    if function_alias in {"gettperattestationcert", "gettperattestationcertificate"}:
         return build("Get", "_CertData_TPerAttestation", raw_args=[("startRow", 0), ("endRow", 0x5FF)], optional={"authAs": "Anybody"}, sp_value="AdminSP", auth_value="Anybody")
 
-    if function_name == "get_tpersign_cert":
-        return build("Get", "_CertData_TPerSign", raw_args=[("startRow", 0), ("endRow", 0x5FF)], optional={"authAs": "Anybody"}, sp_value="AdminSP", auth_value="Anybody")
+    if function_alias in {"gettpersigncert", "gettpersigncertificate"}:
+        auth_as = _arg_or_kw(args, kwargs, 0, "authAs", "AuthAs") or "Anybody"
+        return build("Get", "_CertData_TPerSign", raw_args=[], optional={"authAs": auth_as}, sp_value="AdminSP", auth_value=auth_as)
 
-    if function_name == "getpskentry":
+    if function_alias == "getpskentry":
         psk = _arg_or_kw(args, kwargs, 0, "psk", "PSK")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or "Anybody"
         sp_value = _arg_or_kw(args, kwargs, 2, "sp", "SP") or "AdminSP"
         target = f"TLS_PSK_Key{psk}" if isinstance(psk, int) else psk
         return build("Get", target, optional={"authAs": auth_as}, sp_value=sp_value, auth_value=auth_as)
 
-    if function_name == "setpskentry":
+    if function_alias == "setpskentry":
         psk = _arg_or_kw(args, kwargs, 0, "psk", "PSK")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or _mapping_value(kwargs, "authAs", "AuthAs")
         target = f"TLS_PSK_Key{psk}" if isinstance(psk, int) else psk
         optional = {key: value for key, value in kwargs.items() if re.sub(r"[^A-Za-z0-9_]", "", _as_text(key)).lower() not in {"psk", "authas"}}
         optional["authAs"] = auth_as
+        if _mapping_value(optional, "CipherSuite", "cipherSuite") is None:
+            optional["__MissingRequiredCipherSuite"] = True
         if isinstance(auth_as, (list, tuple)) and auth_as and all(isinstance(item, (list, tuple)) and len(item) >= 2 for item in auth_as):
             optional["__RequireAllAuthAsValid"] = True
         return build("Set", target, optional=optional, sp_value="AdminSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "getport":
+    if function_alias == "getport":
         port = _arg_or_kw(args, kwargs, 0, "uid", "UID", "port")
         auth_as = _arg_or_kw(args, kwargs, 1, "authAs", "AuthAs") or "SID"
         return build("Get", port, optional={"authAs": auth_as}, sp_value="AdminSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "getauthority":
+    if function_alias == "getauthority":
         auth = _arg_or_kw(args, kwargs, 0, "auth", "Auth", "authority", "Authority")
         target = _arg_or_kw(args, kwargs, 1, "obj", "object", "Object") or auth
         auth_as = _arg_or_kw(args, kwargs, 2, "authAs", "AuthAs") or auth
         return build("Get", target, optional={"authAs": auth_as}, auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "get_mek":
+    if function_alias == "getmek":
         range_no = _arg_or_kw(args, kwargs, 0, "rangeNo", "range", "Range", "range_no")
         auth = _arg_or_kw(args, kwargs, 1, "auth", "Auth")
         auth_as = _arg_or_kw(args, kwargs, 2, "authAs", "AuthAs") or auth
         return build("Get", f"Band{_parse_int(range_no) or range_no}", raw_args=[(3, 0x0A), (4, 0x0A)], optional={"authAs": auth_as}, sp_value="LockingSP", auth_value=auth_as, challenge=_authas_credential_arg({}, {"authAs": auth_as}, None))
 
-    if function_name == "lockinginfo":
+    if function_alias == "lockinginfo":
         return build("Get", "LockingInfo", sp_value="LockingSP", auth_value="Anybody")
 
     return None
@@ -1411,7 +1510,17 @@ def _walk_named_column_values(node: Any, symbol: str = "") -> dict[int, Any]:
 
 
 def _values(optional: dict[str, Any], raw_args: Any, symbol: str = "") -> dict[int, Any]:
-    found, values_node = _dict_lookup(optional, "Values")
+    found, values_node = _dict_lookup(
+        optional,
+        "Values",
+        "Value",
+        "RowValues",
+        "rowValues",
+        "NamedValues",
+        "namedValues",
+        "SetValues",
+        "setValues",
+    )
     if found:
         values = _walk_column_values(values_node)
         values.update(_walk_named_column_values(values_node, symbol))
@@ -1454,7 +1563,7 @@ def _is_byte_table_uid(uid: str) -> bool:
 
 
 def _has_explicit_row_values(event: Any) -> bool:
-    values = _mapping_value(event.optional, "Values")
+    values = _mapping_value(event.optional, "Values", "Value", "RowValues", "rowValues", "NamedValues", "namedValues", "SetValues", "setValues")
     return values is not None and bool(_walk_column_values(values))
 
 
@@ -2356,15 +2465,29 @@ def _output_status_value(output: dict[str, Any], inp: dict[str, Any] | None = No
 
 
 def _output_return_values(raw: dict[str, Any]) -> Any:
+    def high_level_object_return(returned: Any) -> Any:
+        if isinstance(returned, (list, tuple)) and len(returned) == 2 and isinstance(returned[1], bool):
+            first = returned[0]
+            if first is None or isinstance(first, (dict, list, tuple, bytes, bytearray)):
+                return first
+            if _normalize_status(first) not in {SUCCESS, NOT_AUTHORIZED, INVALID_PARAMETER, INSUFFICIENT_SPACE, INSUFFICIENT_ROWS, FAIL, "PASS"}:
+                return first
+        return None
+
     output = _output_section(raw)
     names = (
         "return_values",
         "ReturnValues",
         "returnValues",
+        "return_value",
+        "ReturnValue",
+        "returnValue",
         "returned_values",
         "returnedValues",
         "returnedNamedValues",
         "ReturnedNamedValues",
+        "namedReturnValues",
+        "NamedReturnValues",
         "rvs",
         "RVs",
         "rv",
@@ -2379,6 +2502,9 @@ def _output_return_values(raw: dict[str, Any]) -> Any:
         return value
     found, returned = _dict_lookup(output, "return", "Return", "returns", "Returns")
     if found and isinstance(returned, (list, tuple)):
+        high_level_return = high_level_object_return(returned)
+        if high_level_return is not None or (len(returned) == 2 and isinstance(returned[1], bool) and returned[0] is None):
+            return high_level_return
         if len(returned) >= 3 and not _empty_payload(returned[2]):
             return returned[2]
         if len(returned) >= 2:
@@ -2393,6 +2519,9 @@ def _output_return_values(raw: dict[str, Any]) -> Any:
         return value
     found, returned = _dict_lookup(output_args, "return", "Return", "returns", "Returns")
     if found and isinstance(returned, (list, tuple)):
+        high_level_return = high_level_object_return(returned)
+        if high_level_return is not None or (len(returned) == 2 and isinstance(returned[1], bool) and returned[0] is None):
+            return high_level_return
         if len(returned) >= 3 and not _empty_payload(returned[2]):
             return returned[2]
         if len(returned) >= 2:
@@ -2457,8 +2586,9 @@ def parse_event(raw: dict[str, Any]) -> Event:
     out = _output_section(raw)
 
     function_name = _function_name(inp)
-    if function_name in {
-        "_debugpackets",
+    function_alias = _function_alias(function_name)
+    if function_alias in {
+        "debugpackets",
         "currentciphersuite",
         "fipsapprovedmode",
         "fipscompliance",
@@ -2474,11 +2604,11 @@ def parse_event(raw: dict[str, Any]) -> Event:
         return Event(
             raw=raw,
             kind="host_io",
-            method=function_name,
+            method=function_alias,
             status=_high_level_status(raw, out, inp),
         )
 
-    if function_name in {"tcgreset", "stackreset", "protocolstackreset"}:
+    if function_alias in {"tcgreset", "stackreset", "protocolstackreset"}:
         return Event(
             raw=raw,
             kind="host_io",
@@ -2486,7 +2616,7 @@ def parse_event(raw: dict[str, Any]) -> Event:
             status=SUCCESS if _return_bool(raw) is not False else FAIL,
         )
 
-    if function_name in {"checkpin", "_checkpin"}:
+    if function_alias in {"checkpin"}:
         args = _mapping_value(inp, "args", "Args", "arguments", "Arguments")
         args_list = list(args) if isinstance(args, (list, tuple)) else []
         kwargs = _invoke_kwargs(inp)
@@ -2511,7 +2641,7 @@ def parse_event(raw: dict[str, Any]) -> Event:
     if high_level is not None:
         return high_level
 
-    found_command, command = _dict_lookup(inp, "command", "Command")
+    found_command, command = _dict_lookup(inp, "command", "Command", "operation", "Operation", "type", "Type")
     if not found_command:
         found_command, command = _dict_lookup(raw, "command", "Command", "operation", "Operation", "type", "Type")
     if not found_command:

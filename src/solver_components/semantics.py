@@ -74,9 +74,18 @@ def _authority_is_enabled(state: State, sp: str | None, authority: str | None) -
     return True
 
 
+def _authority_locked_out(state: State, authority: str | None) -> bool:
+    if authority is None or authority in {"Anybody", "Admins", "Users", "Makers"}:
+        return False
+    try_limit = state.pin_try_limits.get(authority, 0)
+    return try_limit > 0 and state.pin_tries.get(authority, 0) >= try_limit
+
+
 def _authority_allowed_in_sp(sp: str | None, authority: str | None) -> bool:
     if authority is None or authority == "Anybody":
         return True
+    if authority == "MSID":
+        return False
     if sp == "AdminSP":
         if authority.startswith("User"):
             return False

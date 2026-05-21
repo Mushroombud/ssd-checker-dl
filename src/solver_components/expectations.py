@@ -405,12 +405,18 @@ def _expected_set(state: State, event: Event) -> ExpectedResponse:
     required = _set_required_authorities(state, event)
     if not _has_any_authority(state, required) and not _master_authorizes_set(state, event) and not _ace_authorizes_set(state, event):
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"Set requires one of {sorted(required)}", confidence="high")
+    if _as_bool(_mapping_value(event.optional, "__InvalidTcgApiUserArgument")):
+        return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="TCGstorageAPI access wrapper requires a user identifier with digits", confidence="high")
+    if _as_bool(_mapping_value(event.optional, "__MissingRequiredCipherSuite")):
+        return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="TCGstorageAPI setPskEntry requires CipherSuite", confidence="high")
     if _as_bool(_mapping_value(event.optional, "__RequireAllAuthAsValid")):
         for authority, credential in _authas_pairs(event.required, event.optional, _method_raw_args(event)):
             if authority in {None, "Anybody", "Admins", "Users"}:
                 continue
             if not credential:
                 return ExpectedResponse({NOT_AUTHORIZED, FAIL}, forbidden_statuses={SUCCESS}, reason="Wrapper-level Set requires each authAs credential to be present", confidence="high")
+            if _authority_locked_out(state, authority):
+                return ExpectedResponse({NOT_AUTHORIZED, FAIL}, forbidden_statuses={SUCCESS}, reason="Wrapper-level Set failed a secondary authAs authority state check", confidence="high")
             known_pin = state.pins.get(authority)
             if known_pin is not None and _credential_text(credential) != known_pin:
                 return ExpectedResponse({NOT_AUTHORIZED, FAIL}, forbidden_statuses={SUCCESS}, reason="Wrapper-level Set failed a secondary authAs credential check", confidence="high")
@@ -613,6 +619,17 @@ def _expected_get_free_space(state: State, event: Event) -> ExpectedResponse:
     return ExpectedResponse({SUCCESS}, reason="GetFreeSpace is allowed on the current SP", confidence="high")
 
 
+def _psid_map_contains_wwn(psid_map: dict[Any, Any], wwn: Any) -> bool:
+    variants: set[Any] = {wwn}
+    text = _as_text(wwn)
+    if text:
+        variants.update({text, text.lower(), text.upper()})
+    parsed = _parse_int(wwn)
+    if parsed is not None:
+        variants.update({parsed, hex(parsed), hex(parsed).lower(), hex(parsed).upper()})
+    return any(key in psid_map for key in variants)
+
+
 def _expected_revert(state: State, event: Event) -> ExpectedResponse:
     if not state.session.open:
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{event.method} requires an open session", confidence="high")
@@ -626,6 +643,9 @@ def _expected_revert(state: State, event: Event) -> ExpectedResponse:
         required = {"Admins"}
     else:
         required = {"SID", "PSID", "Admins"}
+    found_psid_map, psid_map = _dict_lookup(event.optional, "__PSIDCredentialMap")
+    if found_psid_map and state.wwn is not None and isinstance(psid_map, dict) and not _psid_map_contains_wwn(psid_map, state.wwn):
+        return ExpectedResponse({FAIL}, forbidden_statuses={SUCCESS}, reason="TCGstorageAPI revert returns False when the PSID map lacks this drive WWN", confidence="high")
     if not _has_any_authority(state, required):
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{event.method} requires one of {sorted(required)}", confidence="high")
     if event.method == "RevertSP" and state.session.sp == "LockingSP" and _keep_global_range_key(event):
