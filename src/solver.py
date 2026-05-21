@@ -9,6 +9,7 @@ INVALID_PARAMETER = "INVALID_PARAMETER"
 INSUFFICIENT_SPACE = "INSUFFICIENT_SPACE"
 INSUFFICIENT_ROWS = "INSUFFICIENT_ROWS"
 FAIL = "FAIL"
+PROTOCOL_STACK_RESET = -1
 
 
 # Offline copies of the Seagate TCGstorageAPI Opal UID/column semantics used by
@@ -64,6 +65,7 @@ FIXED_SP_BY_UID = {
 FIXED_OBJECT_BY_UID = {
     "0000000000000001": "ThisSP",
     "00000000000000FF": "SessionManager",
+    "0000000100000000": "Table",
     "0000000100000001": "Table",
     "0000000100000002": "Table_SPInfo",
     "0000000100000003": "Table_SPTemplates",
@@ -73,6 +75,8 @@ FIXED_OBJECT_BY_UID = {
     "0000000100000009": "Table_Authority",
     "000000010000000B": "Table_C_PIN",
     "000000010000001D": "Table_SecretProtect",
+    "0000000100000201": "Table_TPerInfo",
+    "0000000100000204": "Table_Template",
     "0000000100000205": "Table_SP",
     "0000000100000801": "Table_LockingInfo",
     "0000000100000802": "Table_Locking",
@@ -89,6 +93,7 @@ FIXED_OBJECT_BY_UID = {
     "0000000B00000001": "C_PIN_SID",
     "0000000B00008401": "C_PIN_EraseMaster",
     "0000000200000001": "SPInfo",
+    "0000000300000000": "SPTemplatesTable",
     "0000000300000001": "SPTemplates_Base",
     "0000000300000002": "SPTemplates_Admin",
     "0000000600000000": "MethodIDTable",
@@ -99,6 +104,9 @@ FIXED_OBJECT_BY_UID = {
     "000000090001FF05": "TperAttestation",
     "0000000B00000000": "C_PINTable",
     "0000001D00000000": "SecretProtectTable",
+    "0000020100030001": "TPerInfo",
+    "0000020400000000": "TemplateTable",
+    "0000020500000000": "SPTable",
     "0000110100000001": "DataRemovalMechanism",
     "0001000400000000": "_CertData_TPerSign",
     "0001001F00000000": "_CertData_TPerAttestation",
@@ -117,21 +125,15 @@ FIXED_OBJECT_BY_UID = {
 }
 
 SUPPORTED_METHODS_BY_SP = {
-    "AdminSP": {"Next", "GetACL", "Get", "Set", "CreateRow", "DeleteRow", "Authenticate", "Revert", "RevertSP", "Activate", "Random", "Sign", "FirmwareAttestation"},
-    "LockingSP": {"Next", "GetACL", "GenKey", "RevertSP", "Get", "Set", "CreateRow", "DeleteRow", "Authenticate", "Random"},
+    "AdminSP": {"Next", "GetACL", "AddACE", "RemoveACE", "SetACL", "Get", "Set", "CreateRow", "DeleteRow", "GetFreeSpace", "GetFreeRows", "Authenticate", "Revert", "RevertSP", "Activate", "Random", "Sign", "FirmwareAttestation", "Erase"},
+    "LockingSP": {"Next", "GetACL", "AddACE", "RemoveACE", "SetACL", "GenKey", "RevertSP", "Get", "Set", "CreateRow", "DeleteRow", "GetFreeSpace", "GetFreeRows", "Authenticate", "Random", "Erase"},
 }
 
 UNSUPPORTED_OPAL_METHODS = {
     "CreateTable",
     "DeleteSP",
     "Delete",
-    "GetFreeSpace",
-    "GetFreeRows",
     "DeleteMethod",
-    "AddACE",
-    "RemoveACE",
-    "SetACL",
-    "Erase",
 }
 
 # tcgSupport.tokens_table / locking_table / c_tls_psk_table.
@@ -179,8 +181,34 @@ TLS_PSK_COLUMNS = {
     4: "PSK",
     5: "CipherSuite",
 }
+
+ADMIN_ONLY_TABLE_ROWS = {
+    "Table_TPerInfo",
+    "Table_Template",
+    "Table_SP",
+    "Table_DataRemovalMechanism",
+}
+
+LOCKING_ONLY_TABLE_ROWS = {
+    "Table_SecretProtect",
+    "Table_LockingInfo",
+    "Table_Locking",
+    "Table_MBRControl",
+    "Table_MBR",
+    "Table_K_AES_128",
+    "Table_K_AES_256",
+    "Table_DataStore",
+}
+DATA_REMOVAL_MECHANISM_VALUES = {
+    0: "Overwrite Data Erase",
+    1: "Block Erase",
+    2: "Cryptographic Erase",
+    5: "Vendor Specific Erase",
+}
 ACE_BOOLEAN_EXPR_COLUMN = 3
 ACE_COLUMNS_COLUMN = 4
+K_AES_KEY_COLUMN = 3
+K_AES_MODE_COLUMN = 4
 
 
 def _clean_uid(value: Any) -> str:
@@ -355,6 +383,10 @@ def _object_by_uid(uid: str, fallback_name: str = "") -> str:
         return FIXED_OBJECT_BY_UID[uid]
     normalized = _normalize_name(fallback_name)
 
+    method = _method_by_uid(uid)
+    if method is not None:
+        return f"MethodID_{method}"
+
     authority = _authority_by_uid(uid)
     if authority is not None:
         return f"Authority_{authority}"
@@ -395,6 +427,18 @@ def _object_by_uid(uid: str, fallback_name: str = "") -> str:
     if data_store_index is not None:
         return f"DataStore{data_store_index}"
 
+    sp_templates_index = _uid_suffix_index(uid, "000000030000")
+    if sp_templates_index is not None:
+        return f"SPTemplates_{sp_templates_index}"
+
+    secret_protect_index = _uid_suffix_index(uid, "0000001D000000")
+    if secret_protect_index is not None:
+        return f"SecretProtect_{secret_protect_index}"
+
+    template_index = _uid_suffix_index(uid, "000002040000")
+    if template_index is not None:
+        return f"Template_{template_index}"
+
     tls_psk_index = _uid_suffix_index(uid, "0000001E000000")
     if tls_psk_index is not None:
         return f"TLS_PSK_Key{tls_psk_index - 1}"
@@ -402,6 +446,10 @@ def _object_by_uid(uid: str, fallback_name: str = "") -> str:
     port_index = _uid_suffix_index(uid, "000100020001")
     if port_index is not None:
         return f"Port{port_index}"
+
+    access_control_index = _uid_suffix_index(uid, "0000000700")
+    if access_control_index is not None:
+        return f"AccessControl_{uid[-8:]}"
 
     ace_index = _uid_suffix_index(uid, "0000000800")
     if ace_index is not None:
@@ -474,6 +522,9 @@ def _normalize_name(name: Any) -> str:
         "ACE": "ACETable",
         "AccessControl": "AccessControlTable",
         "MethodID": "MethodIDTable",
+        "SPTemplates": "SPTemplatesTable",
+        "Template": "TemplateTable",
+        "SP": "SPTable",
         "K_AES_256": "K_AES_256Table",
         "K_AES_128": "K_AES_128Table",
     }
@@ -543,6 +594,9 @@ def _is_table_symbol(symbol: str) -> bool:
         "C_PINTable",
         "SecretProtectTable",
         "LockingTable",
+        "SPTemplatesTable",
+        "TemplateTable",
+        "SPTable",
         "K_AES_128Table",
         "K_AES_256Table",
         "MBR",
@@ -621,11 +675,15 @@ def _normalize_status(value: Any) -> str | None:
         return _normalize_status(int(key[2:], 16))
     aliases = {
         "SUCCESS": SUCCESS,
+        "SUCCESSCODE": SUCCESS,
         "0": SUCCESS,
         "PASS": "PASS",
         "FAIL": FAIL,
         "NOTAUTHORIZED": NOT_AUTHORIZED,
         "1": NOT_AUTHORIZED,
+        "OBSOLETE": FAIL,
+        "OBSOLETECODE": FAIL,
+        "2": FAIL,
         "INVALIDPARAMETER": INVALID_PARAMETER,
         "12": INVALID_PARAMETER,
         "0C": INVALID_PARAMETER,
@@ -657,6 +715,14 @@ def _normalize_status(value: Any) -> str | None:
         "UNEXPECTEDRESULTS": FAIL,
         "TLSALERT": FAIL,
     }
+    for prefix in ("STATUSCODE", "PYSEDSTATUSCODE", "TCGSTATUSCODE"):
+        if key.startswith(prefix):
+            stripped = key.removeprefix(prefix)
+            if stripped in aliases:
+                return aliases[stripped]
+    for alias, normalized in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+        if alias and alias != "0" and alias in key:
+            return normalized
     return aliases.get(key, key)
 
 
@@ -678,6 +744,15 @@ def _enabled_bool(value: Any) -> bool:
         return value == 1
     text = _as_text(value).strip().lower()
     return text in {"1", "true", "t", "yes", "y", "enabled", "on"}
+
+
+def _is_bool_literal(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return value in {0, 1}
+    text = _as_text(value).strip().lower()
+    return text in {"0", "1", "true", "false"}
 
 
 def _parse_int(value: Any) -> int | None:
@@ -782,13 +857,22 @@ def _reset_types(value: Any) -> set[int]:
     return {parsed} if parsed is not None else set()
 
 
+def _reset_list_invalid(value: Any) -> bool:
+    reset_types = _reset_types(value)
+    if not reset_types:
+        return False
+    return 0 not in reset_types or not reset_types <= {0, 1, 3}
+
+
 def _reset_event_type(method: str) -> int | None:
     text = re.sub(r"[^A-Za-z0-9]+", "", _as_text(method or "")).upper()
     if text in {"POWERCYCLE", "POWERRESET", "COLDRESET"}:
         return 0
     if text in {"HARDWARERESET", "HWRESET"}:
         return 1
-    if text in {"TPERRESET", "TCGRESET", "PROGRAMMATICRESET", "PROTOCOLSTACKRESET", "STACKRESET"}:
+    if text in {"PROTOCOLSTACKRESET", "STACKRESET", "TCGRESET"}:
+        return PROTOCOL_STACK_RESET
+    if text in {"TPERRESET", "PROGRAMMATICRESET"}:
         return 3
     if text == "RESET":
         return 0
@@ -913,6 +997,30 @@ def _column_from_name(name: Any, symbol: str = "", siblings: set[str] | None = N
         return PIN_COLUMN
     if key in {"_MINPINLENGTH", "MINPINLENGTH"}:
         return MIN_PIN_COLUMN
+    if symbol == "SPInfo":
+        spinfo_names = {
+            "SPSESSIONTIMEOUT": 5,
+            "ENABLED": 6,
+        }
+        if key in spinfo_names:
+            return spinfo_names[key]
+    if symbol in {"AdminSP", "LockingSP"} and key == "FROZEN":
+        return 7
+    common_object_names = {
+        "UID": 0,
+        "NAME": 1,
+        "COMMONNAME": 2,
+    }
+    if key in common_object_names:
+        return common_object_names[key]
+    if symbol.startswith("ACE_"):
+        ace_names = {
+            "BOOLEANEXPR": ACE_BOOLEAN_EXPR_COLUMN,
+            "BOOLEANEXPRESSION": ACE_BOOLEAN_EXPR_COLUMN,
+            "COLUMNS": ACE_COLUMNS_COLUMN,
+        }
+        if key in ace_names:
+            return ace_names[key]
     locking_names = {
         "RANGESTART": 3,
         "RANGELENGTH": 4,
@@ -951,6 +1059,10 @@ def _column_from_name(name: Any, symbol: str = "", siblings: set[str] | None = N
         return 4
     if key == "CIPHERSUITE":
         return 5
+    if key == "ACTIVEDATAREMOVALMECHANISM" and symbol == "DataRemovalMechanism":
+        return 1
+    if key == "PROGRAMMATICRESETENABLE" and symbol == "TPerInfo":
+        return 8
     locking_info_names = {
         "MAXRANGES": 4,
         "ALIGNMENTREQUIRED": 7,
@@ -1383,6 +1495,124 @@ def _authenticate_authority_arg(raw_args: Any) -> Any:
     return walk(raw_args)
 
 
+def _authas_credential_arg(required: dict[str, Any], optional: dict[str, Any], raw_args: Any) -> Any:
+    def from_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            found, item = _dict_lookup(value, "AuthAs", "authAs")
+            if found:
+                return from_value(item)
+            found, item = _dict_lookup(
+                value,
+                "Credential",
+                "credential",
+                "Cred",
+                "cred",
+                "PIN",
+                "pin",
+                "HostChallenge",
+                "Challenge",
+                "plainText",
+                "PlainText",
+            )
+            if found:
+                return item
+            authority = _authority_from_value(_mapping_value(value, "Authority", "HostSigningAuthority", "auth", "Auth"))
+            if authority is not None:
+                found, item = _dict_lookup(value, "Value", "value")
+                if found:
+                    return item
+            for item in value.values():
+                found = from_value(item)
+                if found is not None:
+                    return found
+            return None
+        if isinstance(value, (list, tuple)):
+            if len(value) == 2 and re.sub(r"[^A-Za-z0-9]", "", _as_text(value[0])).lower() in {"authas", "hostsigningauthority"}:
+                return from_value(value[1])
+            if len(value) >= 2 and _authority_from_value(value[0]) is not None:
+                return value[1]
+            if len(value) >= 2 and _unspecified_authority(value[0]):
+                return value[1]
+            for item in value:
+                found = from_value(item)
+                if found is not None:
+                    return found
+        return None
+
+    for source in (required, optional):
+        found, value = _dict_lookup(source, "AuthAs", "authAs")
+        if found:
+            credential = from_value(value)
+            if credential is not None:
+                return credential
+    if isinstance(raw_args, dict):
+        credential = from_value(raw_args)
+        if credential is not None:
+            return credential
+    return from_value(raw_args)
+
+
+def _unspecified_authority(value: Any) -> bool:
+    if value is None:
+        return True
+    text = _as_text(value).strip().lower()
+    return text in {"", "none", "null"}
+
+
+def _authas_pairs(required: dict[str, Any], optional: dict[str, Any], raw_args: Any) -> list[tuple[str | None, Any]]:
+    sources: list[Any] = []
+    for source in (required, optional):
+        found, value = _dict_lookup(source, "AuthAs", "authAs")
+        if found:
+            sources.append(value)
+    if isinstance(raw_args, dict):
+        found, value = _dict_lookup(raw_args, "AuthAs", "authAs")
+        if found:
+            sources.append(value)
+    found, value = _sequence_named_arg_value(raw_args, "AuthAs", "authAs")
+    if found:
+        sources.append(value)
+
+    pairs: list[tuple[str | None, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            found, nested = _dict_lookup(value, "AuthAs", "authAs")
+            if found:
+                walk(nested)
+                return
+            found_authority, raw_authority = _dict_lookup(value, "Authority", "HostSigningAuthority", "auth", "Auth")
+            authority = _authority_from_value(raw_authority) if found_authority else None
+            credential = _authas_credential_arg({}, {"authAs": value}, None)
+            if authority is not None and credential is not None:
+                pairs.append((authority, credential))
+                return
+            if found_authority and _unspecified_authority(raw_authority) and credential is not None:
+                pairs.append((None, credential))
+                return
+            for item in value.values():
+                walk(item)
+            return
+        if isinstance(value, (list, tuple)):
+            if len(value) == 2 and re.sub(r"[^A-Za-z0-9]", "", _as_text(value[0])).lower() in {"authas", "hostsigningauthority"}:
+                walk(value[1])
+                return
+            if len(value) >= 2 and not isinstance(value[0], (dict, list, tuple, set)):
+                authority = _authority_from_value(value[0])
+                if authority is not None:
+                    pairs.append((authority, value[1]))
+                    return
+                if _unspecified_authority(value[0]):
+                    pairs.append((None, value[1]))
+                    return
+            for item in value:
+                walk(item)
+
+    for source in sources:
+        walk(source)
+    return pairs
+
+
 def _random_count(event: Any) -> int | None:
     value = _method_arg_value(event, "Count", "count")
     if isinstance(value, (list, tuple)) and value:
@@ -1478,6 +1708,8 @@ def _known_opal_object_symbol(symbol: str, uid: str = "") -> bool:
     if symbol in set(FIXED_OBJECT_BY_UID.values()) | {
         "Table",
         "SPInfo",
+        "Table_TPerInfo",
+        "Table_Template",
         "MethodIDTable",
         "AccessControlTable",
         "ACETable",
@@ -1490,6 +1722,9 @@ def _known_opal_object_symbol(symbol: str, uid: str = "") -> bool:
         "DataRemovalMechanism",
         "MBRControl",
         "LockingInfo",
+        "TPerSign",
+        "TperAttestation",
+        "TPerInfo",
     }:
         return True
     if _is_table_symbol(symbol) or _is_byte_table_symbol(symbol):
@@ -1502,7 +1737,11 @@ def _known_opal_object_symbol(symbol: str, uid: str = "") -> bool:
         or re.fullmatch(r"Port\d+", symbol)
         or re.fullmatch(r"ACE_[0-9A-F]{8}", symbol)
         or re.fullmatch(r"ACE_DataStore\d+_(Get|Set)_All", symbol)
+        or symbol.startswith("AccessControl_")
+        or symbol.startswith("MethodID_")
+        or symbol.startswith("SecretProtect_")
         or symbol.startswith("SPTemplates_")
+        or symbol.startswith("Template_")
     )
 
 
@@ -1515,6 +1754,9 @@ def _table_family(symbol: str) -> str:
         "C_PINTable": "C_PIN",
         "SecretProtectTable": "SecretProtect",
         "LockingTable": "Locking",
+        "SPTemplatesTable": "SPTemplates",
+        "TemplateTable": "Template",
+        "SPTable": "SP",
         "K_AES_128Table": "K_AES_128",
         "K_AES_256Table": "K_AES_256",
     }
@@ -1557,6 +1799,16 @@ def _next_where_invalid(event: Any) -> bool:
         return not row_symbol.startswith("Authority_")
     if family == "ACE":
         return not row_symbol.startswith("ACE_")
+    if family == "AccessControl":
+        return not (row_symbol.startswith("AccessControl_") or (uid.startswith("00000007") and uid != "0000000700000000"))
+    if family == "SecretProtect":
+        return not row_symbol.startswith("SecretProtect_")
+    if family == "SPTemplates":
+        return not row_symbol.startswith("SPTemplates_")
+    if family == "Template":
+        return not row_symbol.startswith("Template_")
+    if family == "SP":
+        return not (row_symbol in {"AdminSP", "LockingSP"} or row_symbol.startswith("UnknownSP_") or uid.startswith("00000205"))
     if row_symbol.startswith("UnknownSP_") or _is_byte_table_symbol(row_symbol):
         return True
     return False
@@ -1584,31 +1836,85 @@ def _flatten_return_values(value: Any, symbol: str = "") -> dict[int, Any]:
     return returned
 
 
-def _cellblock_columns(required: dict[str, Any]) -> set[int]:
+def _cellblock_columns(required: dict[str, Any], raw_args: Any = None, method: str = "") -> set[int]:
     columns: set[int] = set()
-    cellblock = _mapping_value(required, "Cellblock", "CellBlock")
-    if isinstance(cellblock, dict):
-        cellblock = [cellblock]
-    if not isinstance(cellblock, list):
-        return columns
 
-    start: int | None = None
-    end: int | None = None
-    for item in cellblock:
-        if not isinstance(item, dict):
-            continue
+    def add_bounds(start: int | None, end: int | None) -> None:
+        if start is not None and end is not None:
+            columns.update(range(min(start, end), max(start, end) + 1))
+        elif start is not None:
+            columns.add(start)
+        elif end is not None:
+            columns.add(end)
+
+    def bounds_from_mapping(item: dict[str, Any]) -> tuple[int | None, int | None]:
+        start: int | None = None
+        end: int | None = None
         found, start_value = _dict_lookup(item, "startColumn", "StartColumn", "start_column", "startCol", "StartCol")
         if found:
             start = _parse_int(start_value)
         found, end_value = _dict_lookup(item, "endColumn", "EndColumn", "end_column", "endCol", "EndCol")
         if found:
             end = _parse_int(end_value)
-    if start is not None and end is not None:
-        columns.update(range(min(start, end), max(start, end) + 1))
-    elif start is not None:
-        columns.add(start)
-    elif end is not None:
-        columns.add(end)
+        return start, end
+
+    def add_from_cellblock(cellblock: Any) -> None:
+        if isinstance(cellblock, dict):
+            cellblock = [cellblock]
+        if not isinstance(cellblock, list):
+            return
+        start: int | None = None
+        end: int | None = None
+        for item in cellblock:
+            if not isinstance(item, dict):
+                continue
+            item_start, item_end = bounds_from_mapping(item)
+            start = item_start if item_start is not None else start
+            end = item_end if item_end is not None else end
+        add_bounds(start, end)
+
+    add_from_cellblock(_mapping_value(required, "Cellblock", "CellBlock"))
+    add_bounds(*bounds_from_mapping(required))
+
+    if raw_args is not None:
+        if isinstance(raw_args, dict):
+            add_from_cellblock(_mapping_value(raw_args, "Cellblock", "CellBlock"))
+            add_bounds(*bounds_from_mapping(raw_args))
+        found_start, raw_start = _sequence_named_arg_value(raw_args, "startColumn", "StartColumn", "start_column", "startCol", "StartCol")
+        found_end, raw_end = _sequence_named_arg_value(raw_args, "endColumn", "EndColumn", "end_column", "endCol", "EndCol")
+        if found_start or found_end:
+            add_bounds(_parse_int(raw_start) if found_start else None, _parse_int(raw_end) if found_end else None)
+        if method == "Get" and not isinstance(raw_args, dict):
+            start: int | None = None
+            end: int | None = None
+
+            def walk_no_named(value: Any) -> None:
+                nonlocal start, end
+                if isinstance(value, dict):
+                    for key, val in value.items():
+                        parsed = _parse_int(key)
+                        if parsed == 3:
+                            start = _parse_int(val)
+                        elif parsed == 4:
+                            end = _parse_int(val)
+                        else:
+                            walk_no_named(val)
+                    return
+                if isinstance(value, (list, tuple)):
+                    if len(value) == 2 and not isinstance(value[0], (dict, list, tuple, set)):
+                        parsed = _parse_int(value[0])
+                        if parsed == 3:
+                            start = _parse_int(value[1])
+                            return
+                        if parsed == 4:
+                            end = _parse_int(value[1])
+                            return
+                    for item in value:
+                        walk_no_named(item)
+
+            walk_no_named(raw_args)
+            add_bounds(start, end)
+
     return columns
 
 
@@ -1783,6 +2089,9 @@ class State:
     authority_enabled: dict[str, bool] = field(default_factory=dict)
     locking_sp_activated: bool = False
     observed_sp_lifecycle: dict[str, int] = field(default_factory=dict)
+    sp_enabled: dict[str, bool] = field(default_factory=dict)
+    sp_frozen: dict[str, bool] = field(default_factory=dict)
+    programmatic_reset_enabled: bool = False
     locking_info: dict[str, Any] = field(default_factory=dict)
     ranges: dict[int, RangeState] = field(default_factory=dict)
     range_read_lock_users: dict[int, set[str]] = field(default_factory=dict)
@@ -1840,7 +2149,7 @@ def parse_event(raw: dict[str, Any]) -> Event:
     else:
         method = method_text or method_from_uid or "UNKNOWN"
     values = _values(optional, raw_args, invoking_symbol)
-    columns = _cellblock_columns(required)
+    columns = _cellblock_columns(required, raw_args, method)
     if not invoking_uid:
         authority_symbol = _bare_authority_symbol(invoking_name_source, method, values, columns)
         if authority_symbol is not None:
@@ -1853,6 +2162,8 @@ def parse_event(raw: dict[str, Any]) -> Event:
     if auth_value is None and method == "Authenticate":
         auth_value = _authenticate_authority_arg(raw_args)
     challenge = _raw_arg_value(required, optional, raw_args, "HostChallenge", "Challenge", 0, "0")
+    if challenge is None:
+        challenge = _authas_credential_arg(required, optional, raw_args)
     write_value = _raw_arg_value(required, optional, raw_args, "Write", "write")
     if write_value is None:
         write_value = positional_write
@@ -1886,6 +2197,8 @@ def _has_authority(state: State, authority: str) -> bool:
     if authority == "Anybody":
         return state.session.open
     if authority == "Admins":
+        if state.session.sp == "LockingSP":
+            return any(auth.startswith("Admin") for auth in state.session.authenticated)
         return any(auth == "SID" or auth.startswith("Admin") for auth in state.session.authenticated)
     if authority == "Users":
         return any(auth.startswith("User") for auth in state.session.authenticated)
@@ -1898,8 +2211,24 @@ def _has_any_authority(state: State, authorities: set[str]) -> bool:
     return any(_has_authority(state, authority) for authority in authorities)
 
 
+def _range_master_authorizes(state: State, range_id: int | None) -> bool:
+    if range_id is None:
+        return False
+    if "EraseMaster" in state.session.authenticated:
+        return True
+    return f"BandMaster{range_id}" in state.session.authenticated
+
+
+def _datastore_master_authorizes(state: State) -> bool:
+    return "EraseMaster" in state.session.authenticated or any(_is_band_master(authority) for authority in state.session.authenticated)
+
+
 def _is_user(authority: str | None) -> bool:
     return bool(authority and re.fullmatch(r"User\d+", authority))
+
+
+def _is_band_master(authority: str | None) -> bool:
+    return bool(authority and re.fullmatch(r"BandMaster\d+", authority))
 
 
 def _user_enabled(state: State, authority: str | None) -> bool:
@@ -1921,13 +2250,43 @@ def _authority_is_enabled(state: State, sp: str | None, authority: str | None) -
     return True
 
 
+def _authority_allowed_in_sp(sp: str | None, authority: str | None) -> bool:
+    if authority is None or authority == "Anybody":
+        return True
+    if sp == "AdminSP":
+        if authority.startswith("User"):
+            return False
+        return True
+    if sp == "LockingSP":
+        return authority.startswith(("Admin", "User", "BandMaster")) or authority in {"Admins", "Users", "EraseMaster"}
+    return True
+
+
+def _authority_allowed_for_target_method(state: State, event: Event, authority: str | None) -> bool:
+    if event.method == "Erase" and authority == "EraseMaster":
+        return True
+    if state.session.sp == "LockingSP" and (authority == "EraseMaster" or _is_band_master(authority)):
+        if event.invoking_symbol.startswith(("Locking_", "DataStore")):
+            return True
+        if authority == "EraseMaster" and event.invoking_symbol.startswith("TLS_PSK_Key"):
+            return True
+    return _authority_allowed_in_sp(state.session.sp, authority)
+
+
 def _expected_object_sp(event: Event, state: State | None = None) -> str | None:
     symbol = event.invoking_symbol
     if event.method == "Activate":
         return "AdminSP"
-    if symbol in {"TPerSign", "TperAttestation", "DataRemovalMechanism"} or symbol.startswith("_CertData_"):
+    if symbol in ADMIN_ONLY_TABLE_ROWS:
         return "AdminSP"
-    if symbol.startswith("Table_") or symbol in {"Table", "SPInfo", "SPTemplates_Base", "SPTemplates_Admin", "MethodIDTable", "AccessControlTable", "ACETable"}:
+    if symbol in LOCKING_ONLY_TABLE_ROWS or symbol == "SecretProtectTable" or symbol.startswith("SecretProtect_"):
+        return "LockingSP"
+    if (
+        symbol in {"TPerSign", "TperAttestation", "DataRemovalMechanism", "TPerInfo", "TemplateTable", "SPTable"}
+        or symbol.startswith(("_CertData_", "Template_"))
+    ):
+        return "AdminSP"
+    if symbol.startswith("Table_") or symbol in {"Table", "SPInfo", "SPTemplatesTable", "SPTemplates_Base", "SPTemplates_Admin", "MethodIDTable", "AccessControlTable", "ACETable"}:
         return state.session.sp if state is not None and state.session.sp else None
     if symbol in {"AdminSP", "LockingSP", "C_PIN_MSID", "C_PIN_SID"}:
         return "AdminSP"
@@ -1974,6 +2333,23 @@ def _method_supported_in_session(state: State, event: Event) -> bool:
     return allowed is None or event.method in allowed
 
 
+def _disabled_sp_response(state: State, event: Event) -> ExpectedResponse | None:
+    sp = state.session.sp
+    if not state.session.open or sp is None or state.sp_enabled.get(sp, True):
+        return None
+    if event.method in {"Authenticate", "EndSession", "CloseSession", "SyncSession"}:
+        return None
+    if event.method == "Set" and event.invoking_symbol == "SPInfo" and set(event.values) == {6}:
+        if _is_bool_literal(event.values[6]) and _as_bool(event.values[6]):
+            return None
+    return ExpectedResponse(
+        {FAIL},
+        forbidden_statuses={SUCCESS},
+        reason="Issued-Disabled SP permits only Authenticate, control-session methods, and Set SPInfo.Enabled to re-enable",
+        confidence="high",
+    )
+
+
 def _is_session_manager_target(event: Event) -> bool:
     return event.invoking_symbol in {"", "SessionManager"} or event.invoking_uid == "00000000000000FF"
 
@@ -1994,12 +2370,16 @@ def _expected_start_session(state: State, event: Event) -> ExpectedResponse:
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="StartSession must target the Session Manager", confidence="high")
     if event.sp is None:
         return ExpectedResponse({INVALID_PARAMETER}, reason="StartSession has unknown or invalid SPID", confidence="high")
+    if state.sp_frozen.get(event.sp, False):
+        return ExpectedResponse({FAIL}, forbidden_statuses={SUCCESS}, reason=f"{event.sp} is frozen and cannot accept new sessions", confidence="high")
     if event.sp == "LockingSP" and not state.locking_sp_activated:
         return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER, FAIL}, reason="LockingSP is not activated in reconstructed state", confidence="medium")
 
     authority = event.authority or "Anybody"
     if authority == "Anybody":
         return ExpectedResponse({SUCCESS}, reason="Unauthenticated session is permitted", confidence="high")
+    if not _authority_allowed_in_sp(event.sp, authority):
+        return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{authority} is not an authority in {event.sp}", confidence="high")
     if not _authority_is_enabled(state, event.sp, authority):
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{authority} is not enabled", confidence="high")
     challenge = _credential_text(event.challenge)
@@ -2024,6 +2404,8 @@ def _expected_authenticate(state: State, event: Event) -> ExpectedResponse:
     )
     if authority is None or authority == "Anybody":
         return ExpectedResponse({SUCCESS}, reason="No protected authority requested", confidence="medium")
+    if not _authority_allowed_in_sp(state.session.sp, authority):
+        return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{authority} is not an authority in {state.session.sp}", confidence="high")
     if not _authority_is_enabled(state, state.session.sp, authority):
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{authority} is not enabled", confidence="high")
     challenge = (
@@ -2071,7 +2453,8 @@ def _expected_get(state: State, event: Event) -> ExpectedResponse:
         protected_columns = set(range(3, 20))
         range_id = _range_id_from_symbol(symbol)
         range_acl = range_id is not None and _ace_satisfied(state, _locking_ace_symbol(0xD000, range_id))
-        if (not event.columns or event.columns & protected_columns) and not _has_authority(state, "Admins") and not range_acl:
+        range_master = _range_master_authorizes(state, range_id)
+        if (not event.columns or event.columns & protected_columns) and not _has_authority(state, "Admins") and not range_acl and not range_master:
             return ExpectedResponse({NOT_AUTHORIZED}, reason="Locking range state columns require Admins", confidence="high")
         return ExpectedResponse({SUCCESS}, reason="Authorized Locking range Get is allowed", confidence="high")
     if symbol == "MBRControl":
@@ -2081,13 +2464,37 @@ def _expected_get(state: State, event: Event) -> ExpectedResponse:
             return ExpectedResponse({INVALID_PARAMETER}, reason="Byte table Get cannot request column values in the Cellblock", confidence="high")
         return ExpectedResponse({SUCCESS}, reason="MBR byte table Get is permitted by ACE_Anybody", confidence="high")
     if symbol.startswith("K_AES_") and event.method == "Get":
-        if _ace_expression_configured(state, "ACE_0003BFFF") and not _ace_satisfied(state, "ACE_0003BFFF"):
+        columns = set(event.columns)
+        if not columns:
+            return ExpectedResponse(
+                {NOT_AUTHORIZED, INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="K_AES Get without a Cellblock can include the protected Key column",
+                confidence="medium",
+            )
+        if columns - {0, 1, 2, K_AES_KEY_COLUMN, K_AES_MODE_COLUMN}:
+            return ExpectedResponse(
+                {INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="K_AES Get requested columns outside the K_AES row definition",
+                confidence="high",
+            )
+        if K_AES_KEY_COLUMN in columns:
+            return ExpectedResponse(
+                {NOT_AUTHORIZED, INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="K_AES Key is SecretProtect-protected from Get",
+                confidence="high",
+            )
+        if K_AES_MODE_COLUMN in columns and _ace_expression_configured(state, "ACE_0003BFFF") and not _ace_satisfied(state, "ACE_0003BFFF"):
             return ExpectedResponse({NOT_AUTHORIZED}, reason="K_AES Mode Get is blocked by personalized ACE_K_AES_Mode", confidence="high")
+        if K_AES_MODE_COLUMN not in columns:
+            return ExpectedResponse({SUCCESS}, reason="K_AES metadata Get does not include the protected Key column", confidence="medium")
         return ExpectedResponse({SUCCESS}, reason="K_AES Mode Get is permitted by ACE_K_AES_Mode", confidence="medium")
     if symbol.startswith("DataStore"):
         if _byte_table_get_invalid(event):
             return ExpectedResponse({INVALID_PARAMETER}, reason="Byte table Get cannot request column values in the Cellblock", confidence="high")
-        if not _has_authority(state, "Admins") and not _user_acl_allows_datastore(state, write=False):
+        if not _has_authority(state, "Admins") and not _datastore_master_authorizes(state) and not _user_acl_allows_datastore(state, write=False):
             return ExpectedResponse({NOT_AUTHORIZED}, reason="DataStore Get requires Admins or a personalized read ACE", confidence="medium")
         return ExpectedResponse({SUCCESS}, reason="Authorized DataStore Get is allowed", confidence="medium")
     if symbol.startswith("Authority_"):
@@ -2095,9 +2502,7 @@ def _expected_get(state: State, event: Event) -> ExpectedResponse:
             return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{symbol} Get requires Admins", confidence="medium")
         return ExpectedResponse({SUCCESS}, reason=f"Authorized {symbol} Get is allowed", confidence="medium")
     if symbol.startswith("Port"):
-        if not _has_any_authority(state, {"Admins", "SID"}):
-            return ExpectedResponse({NOT_AUTHORIZED}, reason="Port Get requires SID/Admin authority in the TCGstorageAPI flow", confidence="medium")
-        return ExpectedResponse({SUCCESS}, reason="Authorized Port Get is allowed", confidence="medium")
+        return ExpectedResponse({SUCCESS}, reason="Port Get is readable for TCGstorageAPI status checks", confidence="medium")
     if symbol.startswith("ACE_"):
         if not _has_authority(state, "Admins") and not _ace_satisfied(state, "ACE_00038000"):
             return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{symbol} Get requires Admins", confidence="medium")
@@ -2121,16 +2526,20 @@ def _set_required_authorities(state: State, event: Event) -> set[str]:
         return {"Admins", owner}
     if owner and (owner == "EraseMaster" or owner.startswith("BandMaster")):
         return {"Admins", owner, "SID"}
+    if symbol.startswith("Authority_BandMaster") and set(event.values) and set(event.values) <= {5}:
+        return {"Admins", "SID", "EraseMaster"}
     if symbol.startswith("Authority_User"):
         return {"Admins"}
     if symbol.startswith("Authority_Admin"):
         return {"Admins", "SID"}
     if symbol in {"MBR", "DataStore"}:
         return {"Admins"}
+    if symbol == "SPInfo":
+        return {"Admins"}
     if symbol.startswith(("Locking_", "MBRControl", "ACE_", "DataStore", "Port")):
         return {"Admins"}
     if symbol.startswith("TLS_PSK_Key"):
-        return {"Admins", "SID"}
+        return {"Admins", "EraseMaster"} if state.session.sp == "LockingSP" else {"Admins", "SID"}
     if symbol == "DataRemovalMechanism":
         return {"Admins", "SID"}
     if symbol.startswith("K_AES_"):
@@ -2548,6 +2957,36 @@ def _range_values_overlap(state: State, range_id: int | None, start: int, length
     return False
 
 
+def _parse_data_removal_mechanism(value: Any) -> int | None:
+    parsed = _parse_int(value)
+    if parsed is not None:
+        return parsed
+    key = re.sub(r"[^A-Za-z0-9]", "", _as_text(value or "")).upper()
+    aliases = {
+        "OVERWRITEDATAERASE": 0,
+        "OVERWRITE": 0,
+        "BLOCKERASE": 1,
+        "BLOCK": 1,
+        "CRYPTOGRAPHICERASE": 2,
+        "CRYPTOERASE": 2,
+        "CRYPTOGRAPHIC": 2,
+        "CRYPTO": 2,
+        "VENDORSPECIFICERASE": 5,
+        "VENDORSPECIFIC": 5,
+        "VENDOR": 5,
+    }
+    return aliases.get(key)
+
+
+def _master_authorizes_set(state: State, event: Event) -> bool:
+    symbol = event.invoking_symbol
+    if symbol.startswith("Locking_"):
+        return _range_master_authorizes(state, _range_id_from_symbol(symbol))
+    if symbol.startswith("DataStore"):
+        return _datastore_master_authorizes(state)
+    return False
+
+
 def _range_reencrypt_busy(range_state: RangeState) -> bool:
     return range_state.reencrypt_state != 1
 
@@ -2604,13 +3043,39 @@ def _invalid_set_values(state: State, event: Event) -> bool:
         return _byte_table_set_invalid(event)
     if _is_table_symbol(symbol):
         return True
+    if symbol.startswith(("SPTemplates_", "Template_", "MethodID_", "AccessControl_", "SecretProtect_")):
+        return True
     if symbol.startswith("K_AES_"):
         return True
     if symbol in {"LockingInfo", "MethodIDTable", "Table_MethodID"}:
         return True
+    if symbol == "SPInfo":
+        columns = set(event.values)
+        if not columns or not columns <= {5, 6}:
+            return True
+        if 5 in event.values:
+            timeout = _parse_int(event.values[5])
+            if timeout is None or timeout < 0:
+                return True
+        if 6 in event.values and not _is_bool_literal(event.values[6]):
+            return True
+        return False
+    if symbol in {"AdminSP", "LockingSP"}:
+        columns = set(event.values)
+        if not columns or not columns <= {7}:
+            return True
+        return not _is_bool_literal(event.values[7])
     if symbol == "DataRemovalMechanism":
         columns = set(event.values)
-        return not columns or not columns <= {1}
+        if not columns or not columns <= {1}:
+            return True
+        mechanism = _parse_data_removal_mechanism(event.values.get(1))
+        return mechanism not in DATA_REMOVAL_MECHANISM_VALUES
+    if symbol == "TPerInfo":
+        columns = set(event.values)
+        if not columns or not columns <= {8}:
+            return True
+        return not _is_bool_literal(event.values[8])
     if symbol == "C_PIN_MSID":
         return True
     if symbol.startswith("C_PIN_"):
@@ -2628,7 +3093,10 @@ def _invalid_set_values(state: State, event: Event) -> bool:
             min_pin = state.pin_min_lengths.get(owner or "", 0)
         if PIN_COLUMN in event.values and owner and _credential_length(event.values[PIN_COLUMN]) < min_pin:
             return True
-    if symbol.startswith("ACE_") and ACE_BOOLEAN_EXPR_COLUMN in event.values:
+    if symbol.startswith("ACE_"):
+        columns = set(event.values)
+        if not columns or columns != {ACE_BOOLEAN_EXPR_COLUMN}:
+            return True
         expression = _ace_expression_from_value(event.values[ACE_BOOLEAN_EXPR_COLUMN])
         pin_user = _pin_user_from_set_ace_symbol(symbol)
         if state.session.sp == "LockingSP" and pin_user:
@@ -2636,27 +3104,43 @@ def _invalid_set_values(state: State, event: Event) -> bool:
             return expression.operator != "or" or expression.authorities not in supported
     if symbol.startswith("Locking_"):
         range_id = _range_id_from_symbol(symbol)
+        columns = set(event.values)
+        if not columns or not columns <= set(range(3, 20)):
+            return True
+        if 9 in event.values and _reset_list_invalid(event.values[9]):
+            return True
         if 13 in event.values and _reencrypt_request_invalid(_range(state, range_id or 0), _parse_reencrypt_request(event.values[13])):
             return True
         if _range_values_invalid_for_geometry(state, range_id, event.values):
             return True
-    if symbol.startswith("Authority_") and 5 in event.values:
-        return event.values[5] not in {0, 1, False, True, "0", "1", "False", "True", "false", "true"}
+    if symbol.startswith("Authority_"):
+        columns = set(event.values)
+        if not columns or not columns <= {2, 5}:
+            return True
+        if 5 in event.values and not _is_bool_literal(event.values[5]):
+            return True
     if symbol == "MBRControl":
-        for column in (1, 2, 3):
-            if column in event.values and event.values[column] not in {0, 1, False, True, "0", "1", "False", "True", "false", "true"}:
+        columns = set(event.values)
+        if not columns or not columns <= set(MBR_COLUMNS):
+            return True
+        for column in (1, 2):
+            if column in event.values and not _is_bool_literal(event.values[column]):
                 return True
+        if 3 in event.values and _reset_list_invalid(event.values[3]):
+            return True
     if symbol.startswith("Port"):
         columns = set(event.values)
         if not columns or not columns <= set(PORT_COLUMNS):
             return True
-        if 3 in event.values and event.values[3] not in {0, 1, False, True, "0", "1", "False", "True", "false", "true"}:
+        if 3 in event.values and not _is_bool_literal(event.values[3]):
+            return True
+        if 2 in event.values and _reset_list_invalid(event.values[2]):
             return True
     if symbol.startswith("TLS_PSK_Key"):
         columns = set(event.values)
         if not columns or not columns <= set(TLS_PSK_COLUMNS):
             return True
-        if 3 in event.values and event.values[3] not in {0, 1, False, True, "0", "1", "False", "True", "false", "true"}:
+        if 3 in event.values and not _is_bool_literal(event.values[3]):
             return True
         if 5 in event.values and event.values[5] in {None, ""}:
             return True
@@ -2675,6 +3159,44 @@ def _table_method_common_failure(state: State, event: Event, method: str) -> Exp
     if event.invoking_symbol in {"MBR", "DataStore"} or event.invoking_symbol.startswith("DataStore"):
         return ExpectedResponse({INVALID_PARAMETER}, reason=f"{method} is not available on byte tables", confidence="high")
     return None
+
+
+def _table_query_common_failure(state: State, event: Event, method: str) -> ExpectedResponse | None:
+    if not state.session.open:
+        return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{method} requires an open session", confidence="high")
+    if not _session_allows_object(state, event):
+        return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{method} table does not belong to current SP", confidence="medium")
+    if not _is_table_symbol(event.invoking_symbol) or _is_byte_table_symbol(event.invoking_symbol):
+        return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason=f"{method} is defined for Opal object tables", confidence="high")
+    return None
+
+
+def _ace_method_refs(event: Event) -> list[str]:
+    sources: list[Any] = [event.required, event.optional, _method_raw_args(event)]
+    refs: list[str] = []
+
+    def walk(value: Any) -> None:
+        if not isinstance(value, (dict, list, tuple, set)):
+            text = _as_text(value or "").strip()
+            if re.fullmatch(r"ACE_[0-9A-Fa-f]{8}", text) or re.fullmatch(r"ACE_DataStore\d+_(Get|Set)_All", text, flags=re.IGNORECASE):
+                symbol = _normalize_name(text)
+                if symbol not in refs:
+                    refs.append(symbol)
+                return
+        symbol, _ = _object_ref_from_value(value)
+        if symbol.startswith("ACE_") and symbol not in refs:
+            refs.append(symbol)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk(item)
+
+    for source in sources:
+        walk(source)
+    return refs
 
 
 def _row_uids(event: Event) -> list[str]:
@@ -2769,6 +3291,8 @@ def _expected_create_row(state: State, event: Event) -> ExpectedResponse:
         return common
     if event.invoking_symbol in {"MethodIDTable", "Table_MethodID", "AccessControlTable", "Table_AccessControl"}:
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="CreateRow is not permitted on MethodID or AccessControl tables", confidence="high")
+    if event.invoking_symbol not in {"LockingTable", "Table_Locking"}:
+        return ExpectedResponse({INVALID_PARAMETER, FAIL, NOT_AUTHORIZED}, forbidden_statuses={SUCCESS}, reason="Opal row creation is only modeled for Locking range rows", confidence="medium")
     if not event.values:
         return ExpectedResponse({INVALID_PARAMETER}, reason="CreateRow requires row values", confidence="high")
     if not _has_authority(state, "Admins"):
@@ -2801,6 +3325,8 @@ def _expected_delete_row(state: State, event: Event) -> ExpectedResponse:
         return common
     if event.invoking_symbol in {"MethodIDTable", "Table_MethodID", "AccessControlTable", "Table_AccessControl"}:
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="DeleteRow is not permitted on MethodID or AccessControl tables", confidence="high")
+    if event.invoking_symbol not in {"LockingTable", "Table_Locking"}:
+        return ExpectedResponse({INVALID_PARAMETER, FAIL, NOT_AUTHORIZED}, forbidden_statuses={SUCCESS}, reason="Opal row deletion is only modeled for Locking range rows", confidence="medium")
     row_refs = _row_object_refs(event)
     if not row_refs and not _row_uids(event):
         return ExpectedResponse({INVALID_PARAMETER}, reason="DeleteRow requires row UIDs", confidence="high")
@@ -2834,7 +3360,7 @@ def _expected_set(state: State, event: Event) -> ExpectedResponse:
     if _invalid_set_values(state, event):
         return ExpectedResponse({INVALID_PARAMETER}, reason="Set contains values disallowed by Opal table semantics", confidence="medium")
     required = _set_required_authorities(state, event)
-    if not _has_any_authority(state, required) and not _ace_authorizes_set(state, event):
+    if not _has_any_authority(state, required) and not _master_authorizes_set(state, event) and not _ace_authorizes_set(state, event):
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"Set requires one of {sorted(required)}", confidence="high")
     return ExpectedResponse({SUCCESS}, reason="Authorized Set is allowed", confidence="high")
 
@@ -2865,6 +3391,19 @@ def _expected_genkey(state: State, event: Event) -> ExpectedResponse:
     if range_id is not None and _range_reencrypt_busy(_range(state, range_id)):
         return ExpectedResponse({FAIL, INVALID_PARAMETER}, forbidden_statuses={SUCCESS}, reason="GenKey on a range key is blocked while ReEncryptState is not IDLE", confidence="high")
     return ExpectedResponse({SUCCESS}, reason="Authorized GenKey is allowed", confidence="high")
+
+
+def _expected_erase(state: State, event: Event) -> ExpectedResponse:
+    if not state.session.open:
+        return ExpectedResponse({NOT_AUTHORIZED}, reason="Erase requires an open Enterprise/Locking session", confidence="high")
+    if not state.session.write:
+        return ExpectedResponse({NOT_AUTHORIZED}, reason="Erase requires a read-write session", confidence="high")
+    range_id = _range_id_from_symbol(event.invoking_symbol)
+    if range_id is None or range_id == 0:
+        return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="Erase must target a non-global Band/Locking range", confidence="high")
+    if not _has_authority(state, "EraseMaster"):
+        return ExpectedResponse({NOT_AUTHORIZED}, reason="Erase requires EraseMaster authority", confidence="high")
+    return ExpectedResponse({SUCCESS}, reason="Authorized Erase invalidates the target band media", confidence="medium")
 
 
 def _expected_sign(state: State, event: Event) -> ExpectedResponse:
@@ -2909,6 +3448,8 @@ def _expected_random(state: State, event: Event) -> ExpectedResponse:
 def _expected_next(state: State, event: Event) -> ExpectedResponse:
     if not state.session.open:
         return ExpectedResponse({NOT_AUTHORIZED}, reason="Next requires an open session", confidence="medium")
+    if not _session_allows_object(state, event):
+        return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason="Next table does not belong to current SP", confidence="medium")
     if not _is_next_table_target(event.invoking_symbol, event.invoking_uid):
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="Next is defined only for Opal object tables", confidence="high")
     if _next_count_invalid(event):
@@ -2916,6 +3457,13 @@ def _expected_next(state: State, event: Event) -> ExpectedResponse:
     if _next_where_invalid(event):
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="Next Where must reference a row in the invoking object table", confidence="medium")
     return ExpectedResponse({SUCCESS}, reason="Next is allowed on Opal object tables", confidence="medium")
+
+
+def _expected_table_query(state: State, event: Event) -> ExpectedResponse:
+    common = _table_query_common_failure(state, event, event.method)
+    if common is not None:
+        return common
+    return ExpectedResponse({SUCCESS}, reason=f"{event.method} is allowed on Opal object tables", confidence="medium")
 
 
 def _expected_revert(state: State, event: Event) -> ExpectedResponse:
@@ -2976,8 +3524,15 @@ def _combo_exists_for_get_acl(state: State, event: Event) -> bool | None:
         return _is_table_symbol(symbol) and symbol not in {"MBR", "DataStore", "MethodIDTable", "Table_MethodID", "AccessControlTable", "Table_AccessControl"}
     if method_name == "DeleteRow":
         return _is_table_symbol(symbol) and symbol not in {"MBR", "DataStore", "MethodIDTable", "Table_MethodID", "AccessControlTable", "Table_AccessControl"}
+    if method_name in {"GetFreeSpace", "GetFreeRows"}:
+        return _is_table_symbol(symbol) and not _is_byte_table_symbol(symbol)
+    if method_name in {"AddACE", "RemoveACE", "SetACL"}:
+        return symbol in {"AccessControlTable", "Table_AccessControl", "AccessControl"}
     if method_name == "GenKey":
         return _range_id_from_key(symbol) is not None
+    if method_name == "Erase":
+        range_id = _range_id_from_symbol(symbol)
+        return range_id is not None and range_id != 0
     if method_name == "Sign":
         return symbol == "TPerSign"
     if method_name == "FirmwareAttestation":
@@ -2990,7 +3545,7 @@ def _combo_exists_for_get_acl(state: State, event: Event) -> bool | None:
         if state.session.sp == "AdminSP":
             return symbol == "ThisSP"
         return symbol in {"ThisSP", "LockingSP"} and state.session.sp == "LockingSP"
-    if method_name in {"Authenticate", "Random", "GetACL"}:
+    if method_name in {"Authenticate", "Random", "GetACL", "AddACE", "RemoveACE", "SetACL"}:
         return method_name in SUPPORTED_METHODS_BY_SP.get(state.session.sp or "", set())
     return False
 
@@ -3000,10 +3555,50 @@ def _expected_get_acl(state: State, event: Event) -> ExpectedResponse:
         return ExpectedResponse({NOT_AUTHORIZED}, reason="GetACL requires an open session", confidence="high")
     if event.invoking_symbol not in {"AccessControlTable", "Table_AccessControl", "AccessControl"}:
         return ExpectedResponse({INVALID_PARAMETER, NOT_AUTHORIZED}, reason="GetACL is invoked on the AccessControl table", confidence="medium")
+    found_invoking, _ = _named_method_arg_value(event, "InvokingID", "InvokingId", "Object", "ObjectID", "Table", "TableUID")
+    found_method, _ = _named_method_arg_value(event, "MethodID", "MethodId", "Method")
+    if not found_invoking or not found_method:
+        return ExpectedResponse(
+            {INVALID_PARAMETER, FAIL},
+            forbidden_statuses={SUCCESS},
+            reason="GetACL requires InvokingID and MethodID arguments",
+            confidence="high",
+        )
     combo_exists = _combo_exists_for_get_acl(state, event)
     if combo_exists is False:
         return ExpectedResponse({INVALID_PARAMETER, NOT_AUTHORIZED, FAIL}, reason="GetACL references an unknown InvokingID/MethodID association", confidence="high")
     return ExpectedResponse({SUCCESS}, reason="GetACL is permitted by Opal GetACLACL preconfiguration for known associations", confidence="medium")
+
+
+def _expected_acl_mutation(state: State, event: Event) -> ExpectedResponse:
+    if not state.session.open:
+        return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{event.method} requires an open session", confidence="high")
+    if not state.session.write:
+        return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{event.method} requires a read-write session", confidence="high")
+    if event.invoking_symbol not in {"AccessControlTable", "Table_AccessControl", "AccessControl"}:
+        return ExpectedResponse({INVALID_PARAMETER, NOT_AUTHORIZED}, forbidden_statuses={SUCCESS}, reason=f"{event.method} must be invoked on the AccessControl table", confidence="high")
+    if not _has_authority(state, "Admins"):
+        return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{event.method} requires Admins authority", confidence="high")
+    found_invoking, _ = _named_method_arg_value(event, "InvokingID", "InvokingId", "Object", "ObjectID", "Table", "TableUID")
+    found_method, _ = _named_method_arg_value(event, "MethodID", "MethodId", "Method")
+    if not found_invoking or not found_method:
+        return ExpectedResponse(
+            {INVALID_PARAMETER, FAIL},
+            forbidden_statuses={SUCCESS},
+            reason=f"{event.method} requires InvokingID and MethodID arguments",
+            confidence="high",
+        )
+    combo_exists = _combo_exists_for_get_acl(state, event)
+    if combo_exists is False:
+        return ExpectedResponse(
+            {INVALID_PARAMETER, NOT_AUTHORIZED, FAIL},
+            forbidden_statuses={SUCCESS},
+            reason=f"{event.method} references an unknown InvokingID/MethodID association",
+            confidence="high",
+        )
+    if not _ace_method_refs(event):
+        return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason=f"{event.method} requires an ACE reference", confidence="medium")
+    return ExpectedResponse({SUCCESS}, reason=f"Authorized {event.method} updates an AccessControl ACL", confidence="medium")
 
 
 def expected_status(state: State, event: Event) -> ExpectedResponse:
@@ -3025,10 +3620,15 @@ def expected_status(state: State, event: Event) -> ExpectedResponse:
             reason=f"{event.method} is not supported in {state.session.sp}",
             confidence="high",
         )
+    disabled = _disabled_sp_response(state, event)
+    if disabled is not None:
+        return disabled
     if event.method == "Authenticate":
         return _expected_authenticate(state, event)
     if event.method == "GetACL":
         return _expected_get_acl(state, event)
+    if event.method in {"AddACE", "RemoveACE", "SetACL"}:
+        return _expected_acl_mutation(state, event)
     if event.method == "Get":
         return _expected_get(state, event)
     if event.method == "Set":
@@ -3041,6 +3641,8 @@ def expected_status(state: State, event: Event) -> ExpectedResponse:
         return _expected_activate(state, event)
     if event.method == "GenKey":
         return _expected_genkey(state, event)
+    if event.method == "Erase":
+        return _expected_erase(state, event)
     if event.method == "Sign":
         return _expected_sign(state, event)
     if event.method == "FirmwareAttestation":
@@ -3057,6 +3659,8 @@ def expected_status(state: State, event: Event) -> ExpectedResponse:
         return ExpectedResponse({SUCCESS}, reason="SyncSession is valid in an open session", confidence="medium")
     if event.method == "Next":
         return _expected_next(state, event)
+    if event.method in {"GetFreeSpace", "GetFreeRows"}:
+        return _expected_table_query(state, event)
     if event.method == "Random":
         return _expected_random(state, event)
     return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason="Method is outside the implemented Opal MethodID universe", confidence="medium")
@@ -3175,7 +3779,15 @@ def _remembered_pattern_for_lba(state: State, lba: tuple[int, int] | None) -> tu
 
 
 def _expected_host_io(state: State, event: Event) -> ExpectedResponse:
-    if _reset_event_type(event.method) is not None:
+    reset_type = _reset_event_type(event.method)
+    if reset_type is not None:
+        if reset_type == 3 and not state.programmatic_reset_enabled:
+            return ExpectedResponse(
+                {FAIL, INVALID_PARAMETER, NOT_AUTHORIZED},
+                forbidden_statuses={SUCCESS, None, "PASS"},
+                reason="TPER_RESET is disabled unless TPerInfo.ProgrammaticResetEnable is true",
+                confidence="high",
+            )
         return ExpectedResponse({SUCCESS, None, "PASS"}, reason="Reset events are valid host-side state transitions", confidence="medium")
 
     crossing_error_allowed = _range_crossing_error_allowed(state, event.lba)
@@ -3279,8 +3891,192 @@ def compare_expected_actual(expected: ExpectedResponse, target: Event) -> str:
     return "FAIL"
 
 
+def _method_default_authas_authority(event: Event) -> str | None:
+    raw_args = _method_raw_args(event)
+    value = _raw_arg_value(
+        event.required,
+        event.optional,
+        raw_args,
+        "auth",
+        "Auth",
+        "defAuth",
+        "DefAuth",
+        "defaultAuth",
+        "DefaultAuth",
+        "defaultAuthority",
+        "DefaultAuthority",
+    )
+    return _authority_from_value(value)
+
+
+def _authority_would_satisfy(state: State, authority: str, required: str) -> bool:
+    already_present = authority in state.session.authenticated
+    state.session.authenticated.add(authority)
+    try:
+        return _has_authority(state, required)
+    finally:
+        if not already_present:
+            state.session.authenticated.discard(authority)
+
+
+def _get_required_authorities_for_relevance(event: Event) -> set[str]:
+    symbol = event.invoking_symbol
+    if symbol == "C_PIN_SID":
+        if not event.columns or PIN_COLUMN in event.columns:
+            return set()
+        return {"Admins", "SID"}
+    if symbol.startswith("C_PIN_"):
+        if not event.columns or PIN_COLUMN in event.columns:
+            return set()
+        return {"Admins"}
+    if symbol.startswith("Locking_"):
+        return {"Admins"}
+    if symbol.startswith("DataStore"):
+        return {"Admins", "Users"}
+    if symbol.startswith(("Authority_", "ACE_")):
+        return {"Admins"}
+    return set()
+
+
+def _target_required_authorities_for_relevance(state: State, event: Event) -> set[str]:
+    if event.method == "Set":
+        return _set_required_authorities(state, event)
+    if event.method in {"CreateRow", "DeleteRow", "GenKey"}:
+        return {"Admins"}
+    if event.method == "Activate":
+        return {"SID"}
+    if event.method == "Erase":
+        return {"EraseMaster"}
+    if event.method in {"Revert", "RevertSP"}:
+        if event.method == "RevertSP" and state.session.sp == "AdminSP" and event.invoking_symbol == "ThisSP":
+            return {"PSID"}
+        if state.session.sp == "LockingSP":
+            return {"Admins"}
+        return {"SID", "PSID", "Admins"}
+    if event.method == "Get":
+        return _get_required_authorities_for_relevance(event)
+    return set()
+
+
+def _authority_relevant_for_target(state: State, event: Event, authority: str) -> bool:
+    required = _target_required_authorities_for_relevance(state, event)
+    if any(_authority_would_satisfy(state, authority, item) for item in required):
+        return True
+
+    already_present = authority in state.session.authenticated
+    state.session.authenticated.add(authority)
+    try:
+        if event.method in {"Get", "Set"}:
+            symbol = event.invoking_symbol
+            if symbol.startswith("Locking_") and _range_master_authorizes(state, _range_id_from_symbol(symbol)):
+                return True
+            if symbol.startswith("DataStore") and _datastore_master_authorizes(state):
+                return True
+        if event.method == "Set" and _ace_authorizes_set(state, event):
+            return True
+        if event.method == "Get":
+            symbol = event.invoking_symbol
+            range_id = _range_id_from_symbol(symbol)
+            if range_id is not None and _ace_satisfied(state, _locking_ace_symbol(0xD000, range_id)):
+                return True
+            if symbol.startswith("DataStore") and _user_acl_allows_datastore(state, write=False):
+                return True
+    finally:
+        if not already_present:
+            state.session.authenticated.discard(authority)
+
+    return not required
+
+
+def _add_authority_candidate(candidates: list[str], authority: str | None) -> None:
+    if authority and authority not in candidates:
+        candidates.append(authority)
+
+
+def _owner_fallback_credential_plausible(state: State, owner: str, credential_text: str) -> bool:
+    if owner in state.pins:
+        return True
+    if owner == "SID" or owner == "EraseMaster" or _is_band_master(owner):
+        msid_pin = state.pins.get("MSID")
+        if msid_pin is not None and credential_text:
+            return credential_text == msid_pin
+    return True
+
+
+def _authas_default_authority_candidates(state: State, event: Event, credential: Any) -> list[str]:
+    explicit_default = _method_default_authas_authority(event)
+    if explicit_default is not None:
+        return [explicit_default]
+
+    candidates: list[str] = []
+    credential_text = _credential_text(credential)
+    if credential_text:
+        for authority, pin in state.pins.items():
+            if pin != credential_text:
+                continue
+            if not _authority_allowed_for_target_method(state, event, authority):
+                continue
+            if not _authority_is_enabled(state, state.session.sp, authority):
+                continue
+            if _authority_relevant_for_target(state, event, authority):
+                _add_authority_candidate(candidates, authority)
+    if candidates:
+        return candidates
+
+    owner = _pin_owner_by_object(event.invoking_symbol)
+    if owner and owner != "MSID" and _owner_fallback_credential_plausible(state, owner, credential_text):
+        _add_authority_candidate(candidates, owner)
+
+    required = _target_required_authorities_for_relevance(state, event)
+    if "Admins" in required:
+        _add_authority_candidate(candidates, "Admin1" if state.session.sp == "LockingSP" else "SID")
+    for authority in sorted(required):
+        if authority not in {"Anybody", "Admins", "Users"}:
+            if _owner_fallback_credential_plausible(state, authority, credential_text):
+                _add_authority_candidate(candidates, authority)
+    if "Users" in required:
+        _add_authority_candidate(candidates, "User1")
+    return candidates
+
+
+def _apply_invocation_auth_for_target(state: State, event: Event) -> tuple[str | None, bool]:
+    if event.method in {"StartSession", "Authenticate"} or not state.session.open:
+        return None, False
+    candidates = _authas_pairs(event.required, event.optional, _method_raw_args(event))
+    if event.authority is not None:
+        candidates.insert(0, (event.authority, event.challenge))
+
+    for authority, credential in candidates:
+        authorities = [authority] if authority is not None else _authas_default_authority_candidates(state, event, credential)
+        for resolved_authority in authorities:
+            if resolved_authority in {"Anybody", "Admins", "Users"} or _has_authority(state, resolved_authority):
+                continue
+            if not _authority_allowed_for_target_method(state, event, resolved_authority):
+                continue
+            if not _authority_is_enabled(state, state.session.sp, resolved_authority):
+                continue
+            if not credential:
+                continue
+            known_pin = state.pins.get(resolved_authority)
+            if known_pin is not None and _credential_text(credential) != known_pin:
+                continue
+            if not _authority_relevant_for_target(state, event, resolved_authority):
+                continue
+            state.session.authenticated.add(resolved_authority)
+            return resolved_authority, known_pin is None
+    return None, False
+
+
 def judge_target(state: State, event: Event) -> str:
-    return compare_expected_actual(expected_status(state, event), event)
+    added_authority, credential_unknown = _apply_invocation_auth_for_target(state, event)
+    try:
+        expected = expected_status(state, event)
+        if added_authority is not None and credential_unknown:
+            expected.allowed_statuses = set(expected.allowed_statuses) | {NOT_AUTHORIZED}
+        return compare_expected_actual(expected, event)
+    finally:
+        if added_authority is not None:
+            state.session.authenticated.discard(added_authority)
 
 
 def _auth_from_authenticate_event(event: Event) -> str | None:
@@ -3310,25 +4106,41 @@ def _apply_start_session_success(state: State, event: Event) -> None:
 def _apply_get_success(state: State, event: Event) -> None:
     symbol = event.invoking_symbol
     returned = _flatten_return_values(_output_return_values(event.raw), symbol)
+    owner = _pin_owner_by_object(symbol)
 
+    if owner and MIN_PIN_COLUMN in returned:
+        min_pin = _parse_int(returned[MIN_PIN_COLUMN])
+        if min_pin is not None:
+            state.pin_min_lengths[owner] = min_pin
     if symbol == "C_PIN_MSID" and PIN_COLUMN in returned:
         state.pins["MSID"] = _credential_text(returned[PIN_COLUMN])
         return
 
-    if symbol == "LockingSP" and 6 in returned:
-        lifecycle_value = returned[6]
-        lifecycle = _parse_int(lifecycle_value)
-        if lifecycle is not None:
-            state.observed_sp_lifecycle["LockingSP"] = lifecycle
-        active = _sp_lifecycle_active(lifecycle_value)
-        if active is not None:
-            state.locking_sp_activated = active
+    if symbol in {"AdminSP", "LockingSP"}:
+        if symbol == "LockingSP" and 6 in returned:
+            lifecycle_value = returned[6]
+            lifecycle = _parse_int(lifecycle_value)
+            if lifecycle is not None:
+                state.observed_sp_lifecycle["LockingSP"] = lifecycle
+            active = _sp_lifecycle_active(lifecycle_value)
+            if active is not None:
+                state.locking_sp_activated = active
+        if 7 in returned:
+            state.sp_frozen[symbol] = _as_bool(returned[7])
         return
 
     if symbol == "LockingInfo":
         for column, value in returned.items():
             if column in LOCKING_INFO_COLUMNS:
                 state.locking_info[LOCKING_INFO_COLUMNS[column]] = value
+        return
+
+    if symbol == "TPerInfo" and 8 in returned:
+        state.programmatic_reset_enabled = _as_bool(returned[8])
+        return
+
+    if symbol == "SPInfo" and 6 in returned and state.session.sp is not None:
+        state.sp_enabled[state.session.sp] = _as_bool(returned[6])
         return
 
     range_id = _range_id_from_symbol(symbol)
@@ -3454,11 +4266,24 @@ def _apply_set_success(state: State, event: Event) -> None:
     owner = _pin_owner_by_object(symbol)
     if owner and PIN_COLUMN in event.values:
         state.pins[owner] = _credential_text(event.values[PIN_COLUMN])
+        if MIN_PIN_COLUMN in event.values:
+            min_pin = _parse_int(event.values[MIN_PIN_COLUMN])
+            if min_pin is not None:
+                state.pin_min_lengths[owner] = min_pin
+        return
+    if owner and MIN_PIN_COLUMN in event.values:
+        min_pin = _parse_int(event.values[MIN_PIN_COLUMN])
+        if min_pin is not None:
+            state.pin_min_lengths[owner] = min_pin
         return
 
     authority = _authority_by_object(symbol)
     if authority and 5 in event.values:
         state.authority_enabled[authority] = _as_bool(event.values[5])
+        return
+
+    if symbol in {"AdminSP", "LockingSP"} and 7 in event.values:
+        state.sp_frozen[symbol] = _as_bool(event.values[7])
         return
 
     range_id = _range_id_from_symbol(symbol)
@@ -3470,6 +4295,15 @@ def _apply_set_success(state: State, event: Event) -> None:
         for column, value in event.values.items():
             if column in MBR_COLUMNS:
                 state.mbr[MBR_COLUMNS[column]] = value
+        return
+
+    if symbol == "TPerInfo" and 8 in event.values:
+        state.programmatic_reset_enabled = _as_bool(event.values[8])
+        return
+
+    if symbol == "SPInfo" and 6 in event.values and state.session.sp is not None:
+        state.sp_enabled[state.session.sp] = _as_bool(event.values[6])
+        return
 
 
 def _apply_create_row_success(state: State, event: Event) -> None:
@@ -3498,6 +4332,15 @@ def _apply_delete_row_success(state: State, event: Event) -> None:
         }
 
 
+def _apply_erase_success(state: State, event: Event) -> None:
+    range_id = _range_id_from_symbol(event.invoking_symbol)
+    if range_id is None or range_id == 0:
+        return
+    _range(state, range_id).media_generation += 1
+    state.pins.pop(f"BandMaster{range_id}", None)
+    state.authority_enabled.pop(f"BandMaster{range_id}", None)
+
+
 def _invalidate_lba_patterns(state: State, keep_global: bool = False) -> None:
     state.lba_patterns = {
         lba: (pattern, range_id, generation if keep_global and range_id == 0 else -1)
@@ -3508,8 +4351,11 @@ def _invalidate_lba_patterns(state: State, keep_global: bool = False) -> None:
 def _reset_locking_sp(state: State, keep_global_key: bool = False) -> None:
     global_generation = _range(state, 0).media_generation
     state.locking_sp_activated = False
+    state.sp_enabled.pop("LockingSP", None)
+    state.sp_frozen.pop("LockingSP", None)
     state.authority_enabled = {k: v for k, v in state.authority_enabled.items() if not k.startswith(("User", "Admin"))}
     state.pins = {k: v for k, v in state.pins.items() if not k.startswith(("User", "Admin"))}
+    state.pin_min_lengths = {k: v for k, v in state.pin_min_lengths.items() if not k.startswith(("User", "Admin"))}
     state.ranges = {}
     state.range_read_lock_users.clear()
     state.range_write_lock_users.clear()
@@ -3527,12 +4373,16 @@ def _reset_factory_state(state: State) -> None:
     msid_pin = state.pins.get("MSID")
     global_generation = _range(state, 0).media_generation
     state.pins.clear()
+    state.pin_min_lengths.clear()
     if msid_pin is not None:
         state.pins["MSID"] = msid_pin
         state.pins["SID"] = msid_pin
     state.authority_enabled.clear()
     state.locking_sp_activated = False
     state.observed_sp_lifecycle.clear()
+    state.sp_enabled.clear()
+    state.sp_frozen.clear()
+    state.programmatic_reset_enabled = False
     state.locking_info.clear()
     state.ranges = {}
     state.range_read_lock_users.clear()
@@ -3547,6 +4397,8 @@ def _reset_factory_state(state: State) -> None:
 
 def _apply_reset_event(state: State, reset_type: int) -> None:
     state.session = Session()
+    if reset_type == PROTOCOL_STACK_RESET:
+        return
     for range_state in state.ranges.values():
         if reset_type in range_state.lock_on_reset_types:
             if range_state.read_lock_enabled:
@@ -3560,6 +4412,8 @@ def _apply_reset_event(state: State, reset_type: int) -> None:
 def apply_transition(state: State, event: Event) -> None:
     reset_type = _reset_event_type(event.method)
     if event.kind == "host_io" and event.is_success and reset_type is not None:
+        if reset_type == 3 and not state.programmatic_reset_enabled:
+            return
         _apply_reset_event(state, reset_type)
         return
 
@@ -3618,8 +4472,15 @@ def apply_transition(state: State, event: Event) -> None:
             _range(state, range_id).media_generation += 1
         return
 
+    if event.method == "Erase":
+        _apply_erase_success(state, event)
+        return
+
     if event.method in {"Revert", "RevertSP"}:
-        if event.method == "RevertSP" and state.session.sp == "AdminSP" and event.invoking_symbol == "ThisSP":
+        if (
+            (event.method == "RevertSP" and state.session.sp == "AdminSP" and event.invoking_symbol == "ThisSP")
+            or (event.method == "Revert" and state.session.sp == "AdminSP" and event.invoking_symbol in {"AdminSP", "ThisSP"})
+        ):
             _reset_factory_state(state)
         elif state.session.sp == "LockingSP" or event.invoking_symbol == "LockingSP":
             keep = _keep_global_range_key(event)
@@ -3628,6 +4489,7 @@ def apply_transition(state: State, event: Event) -> None:
             sid_pin = state.pins.get("SID")
             msid_pin = state.pins.get("MSID")
             state.pins.clear()
+            state.pin_min_lengths.clear()
             if msid_pin is not None:
                 state.pins["MSID"] = msid_pin
             if sid_pin is not None:
