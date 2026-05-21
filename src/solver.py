@@ -231,6 +231,23 @@ def _credential_text(value: Any) -> str:
     return _as_text(value)
 
 
+def _credential_length(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    if isinstance(value, dict):
+        for key in ("plainText", "PlainText", "plaintext", "PIN", "pin", "HostChallenge", "Challenge", "value", "Value"):
+            found, item = _dict_lookup(value, key)
+            if found:
+                return _credential_length(item)
+        if len(value) == 1:
+            return _credential_length(next(iter(value.values())))
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return _credential_length(value[0])
+    return len(_credential_text(value).encode("utf-8"))
+
+
 def _uid_suffix_index(uid: str, prefix: str) -> int | None:
     if not uid.startswith(prefix) or len(uid) <= len(prefix):
         return None
@@ -1762,6 +1779,7 @@ class AceExpression:
 class State:
     session: Session = field(default_factory=Session)
     pins: dict[str, str] = field(default_factory=dict)
+    pin_min_lengths: dict[str, int] = field(default_factory=dict)
     authority_enabled: dict[str, bool] = field(default_factory=dict)
     locking_sp_activated: bool = False
     observed_sp_lifecycle: dict[str, int] = field(default_factory=dict)
@@ -2601,9 +2619,15 @@ def _invalid_set_values(state: State, event: Event) -> bool:
             return True
         if PIN_COLUMN in event.values and event.values[PIN_COLUMN] in {None, ""}:
             return True
+        owner = _pin_owner_by_object(symbol)
         if MIN_PIN_COLUMN in event.values:
             min_pin = _parse_int(event.values[MIN_PIN_COLUMN])
-            return min_pin is None or min_pin < 0 or min_pin > 32
+            if min_pin is None or min_pin < 0 or min_pin > 32:
+                return True
+        else:
+            min_pin = state.pin_min_lengths.get(owner or "", 0)
+        if PIN_COLUMN in event.values and owner and _credential_length(event.values[PIN_COLUMN]) < min_pin:
+            return True
     if symbol.startswith("ACE_") and ACE_BOOLEAN_EXPR_COLUMN in event.values:
         expression = _ace_expression_from_value(event.values[ACE_BOOLEAN_EXPR_COLUMN])
         pin_user = _pin_user_from_set_ace_symbol(symbol)
