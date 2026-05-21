@@ -2403,6 +2403,27 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_access_control_row_get_rejects_direct_acl_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Get", "0000000700000001", "AccessControl", "SUCCESS", required={"Cellblock": [{"startColumn": 4, "endColumn": 4}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_access_control_row_get_rejects_all_columns_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Get", "0000000700000001", "AccessControl", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_access_control_row_get_accepts_non_acl_column(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Get", "0000000700000001", "AccessControl", "SUCCESS", required={"Cellblock": [{"startColumn": 3, "endColumn": 3}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_secretprotect_row_set_rejects_readonly_success(self):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP, ADMIN1, "new"),
@@ -2421,6 +2442,34 @@ class SolverRuleTests(unittest.TestCase):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP, ADMIN1, "new"),
             method_record("Set", "0000000800038001", "ACE", "SUCCESS", optional={"Columns": "All"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_authority_get_common_name_allows_anybody(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP),
+            method_record("Get", "0000000900030001", "Authority", "SUCCESS", required={"Cellblock": [{"startColumn": 2, "endColumn": 2}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_authority_get_enabled_requires_admin_success(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP),
+            method_record("Get", "0000000900030001", "Authority", "SUCCESS", required={"Cellblock": [{"startColumn": 5, "endColumn": 5}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_ace_get_common_name_allows_anybody(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP),
+            method_record("Get", "0000000800038001", "ACE", "SUCCESS", required={"Cellblock": [{"startColumn": 2, "endColumn": 2}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_ace_get_boolean_expr_requires_admin_success(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP),
+            method_record("Get", "0000000800038001", "ACE", "SUCCESS", required={"Cellblock": [{"startColumn": 3, "endColumn": 3}]}),
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
