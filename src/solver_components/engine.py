@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from .constants import *
@@ -25,10 +26,20 @@ def compare_expected_actual(expected: ExpectedResponse, target: Event) -> str:
     if actual in expected.forbidden_statuses:
         return "FAIL"
     if actual in expected.allowed_statuses:
+        actual_return_bool = _return_bool(target.raw) if actual == SUCCESS else None
+        if expected.expected_return_bool is not None and actual_return_bool is not None and actual_return_bool != expected.expected_return_bool:
+            return "FAIL"
+        if expected.forbidden_return_bool is not None and actual_return_bool is not None and actual_return_bool == expected.forbidden_return_bool:
+            return "FAIL"
         if actual == SUCCESS and expected.expected_return_length is not None:
             actual_length = _return_payload_length(_output_return_values(target.raw))
             if actual_length is not None and actual_length != expected.expected_return_length:
                 return "FAIL"
+        return "PASS"
+    failure_statuses = {FAIL, NOT_AUTHORIZED, INVALID_PARAMETER, INSUFFICIENT_SPACE, INSUFFICIENT_ROWS}
+    if actual in failure_statuses and expected.allowed_statuses & failure_statuses:
+        return "PASS"
+    if actual in failure_statuses and SUCCESS in expected.forbidden_statuses:
         return "PASS"
     return "FAIL"
 
@@ -83,7 +94,7 @@ def _get_required_authorities_for_relevance(event: Event) -> set[str]:
 def _target_required_authorities_for_relevance(state: State, event: Event) -> set[str]:
     if event.method == "Set":
         return _set_required_authorities(state, event)
-    if event.method in {"CreateRow", "DeleteRow", "GenKey"}:
+    if event.method in {"CreateTable", "CreateRow", "DeleteRow", "Delete", "DeleteSP", "DeleteMethod", "AddACE", "RemoveACE", "SetACL", "GenKey", "GetPackage", "SetPackage"}:
         return {"Admins"}
     if event.method == "Activate":
         return {"SID"}
@@ -210,15 +221,19 @@ def _apply_invocation_auth_for_target(state: State, event: Event) -> tuple[str |
 
 
 def judge_target(state: State, event: Event) -> str:
-    added_authority, credential_unknown = _apply_invocation_auth_for_target(state, event)
+    working_state = state
+    if event.implicit_session and not state.session.open and event.kind == "tcg_method":
+        working_state = copy.deepcopy(state)
+        working_state.session = _implicit_session_for_event(working_state, event, assume_authenticated=False)
+    added_authority, credential_unknown = _apply_invocation_auth_for_target(working_state, event)
     try:
-        expected = expected_status(state, event)
+        expected = expected_status(working_state, event)
         if added_authority is not None and credential_unknown:
             expected.allowed_statuses = set(expected.allowed_statuses) | {NOT_AUTHORIZED}
         return compare_expected_actual(expected, event)
     finally:
         if added_authority is not None:
-            state.session.authenticated.discard(added_authority)
+            working_state.session.authenticated.discard(added_authority)
 
 
 def predict_trajectory(trajectory: list[dict[str, Any]]) -> str:

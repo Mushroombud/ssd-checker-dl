@@ -28,6 +28,7 @@ class Event:
     lba: tuple[int, int] | None = None
     pattern: str | None = None
     read_result: str | None = None
+    implicit_session: bool = False
 
     @property
     def is_success(self) -> bool:
@@ -43,6 +44,8 @@ class ExpectedResponse:
     expected_read_result: str | None = None
     forbidden_read_result: str | None = None
     expected_return_length: int | None = None
+    expected_return_bool: bool | None = None
+    forbidden_return_bool: bool | None = None
     forbid_read_result_presence: bool = False
     reason: str = ""
     confidence: str = "medium"
@@ -92,11 +95,18 @@ class State:
     session: Session = field(default_factory=Session)
     pins: dict[str, str] = field(default_factory=dict)
     pin_min_lengths: dict[str, int] = field(default_factory=dict)
+    pin_try_limits: dict[str, int] = field(default_factory=dict)
+    pin_tries: dict[str, int] = field(default_factory=dict)
+    pin_persistence: dict[str, bool] = field(default_factory=dict)
     authority_enabled: dict[str, bool] = field(default_factory=dict)
     locking_sp_activated: bool = False
     observed_sp_lifecycle: dict[str, int] = field(default_factory=dict)
     sp_enabled: dict[str, bool] = field(default_factory=dict)
     sp_frozen: dict[str, bool] = field(default_factory=dict)
+    deleted_sps: set[str] = field(default_factory=set)
+    pending_deleted_sp: str | None = None
+    created_table_names: set[tuple[str, str, str]] = field(default_factory=set)
+    created_tables: dict[str, tuple[str, str]] = field(default_factory=dict)
     programmatic_reset_enabled: bool = False
     locking_info: dict[str, Any] = field(default_factory=dict)
     ranges: dict[int, RangeState] = field(default_factory=dict)
@@ -105,6 +115,7 @@ class State:
     datastore_read_users: set[str] = field(default_factory=set)
     datastore_write_users: set[str] = field(default_factory=set)
     ace_expressions: dict[tuple[str, str], AceExpression] = field(default_factory=dict)
+    deleted_method_associations: set[tuple[str, str]] = field(default_factory=set)
     mbr: dict[str, Any] = field(default_factory=dict)
     lba_patterns: dict[tuple[int, int], tuple[str, int, int]] = field(default_factory=dict)
 

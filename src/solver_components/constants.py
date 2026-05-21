@@ -22,6 +22,14 @@ PROTOCOL_STACK_RESET = -1
 
 
 METHOD_UIDS = {
+    "000000000000FF01": "Properties",
+    "000000000000FF02": "StartSession",
+    "000000000000FF03": "SyncSession",
+    "000000000000FF04": "StartTrustedSession",
+    "000000000000FF05": "SyncTrustedSession",
+    "000000000000FF06": "CloseSession",
+    "000000000000FF12": "StartTlsSession",
+    "000000000000FF13": "SyncTlsSession",
     "0000000600000002": "CreateTable",
     "0000000600000003": "Delete",
     "0000000600000004": "CreateRow",
@@ -38,6 +46,8 @@ METHOD_UIDS = {
     "000000060000000F": "RemoveACE",
     "0000000600000010": "GenKey",
     "0000000600000011": "RevertSP",
+    "0000000600000012": "GetPackage",
+    "0000000600000013": "SetPackage",
     "0000000600000016": "Get",          # Opalv2 override in pysedSupport.py
     "0000000600000017": "Set",          # Opalv2 override in pysedSupport.py
     "000000060000001C": "Authenticate", # Opalv2 override in pysedSupport.py
@@ -100,6 +110,7 @@ FIXED_OBJECT_BY_UID = {
     "0000020500010001": "LockingSP",
     "0000000B00008402": "C_PIN_MSID",
     "0000000B00000001": "C_PIN_SID",
+    "00000000B0001000": "C_PIN_Admin1",  # TCGstorageAPI pysedSupport.py shortened Admin1 object UID
     "0000000B00008401": "C_PIN_EraseMaster",
     "0000000200000001": "SPInfo",
     "0000000300000000": "SPTemplatesTable",
@@ -135,20 +146,27 @@ FIXED_OBJECT_BY_UID = {
 
 
 SUPPORTED_METHODS_BY_SP = {
-    "AdminSP": {"Next", "GetACL", "AddACE", "RemoveACE", "SetACL", "Get", "Set", "CreateRow", "DeleteRow", "GetFreeSpace", "GetFreeRows", "Authenticate", "Revert", "RevertSP", "Activate", "Random", "Sign", "FirmwareAttestation", "Erase"},
-    "LockingSP": {"Next", "GetACL", "AddACE", "RemoveACE", "SetACL", "GenKey", "RevertSP", "Get", "Set", "CreateRow", "DeleteRow", "GetFreeSpace", "GetFreeRows", "Authenticate", "Random", "Erase"},
+    "AdminSP": {"Next", "GetACL", "AddACE", "RemoveACE", "SetACL", "DeleteMethod", "GenKey", "GetPackage", "SetPackage", "Get", "Set", "CreateTable", "CreateRow", "DeleteRow", "Delete", "DeleteSP", "GetFreeSpace", "GetFreeRows", "Authenticate", "Revert", "RevertSP", "Activate", "Random", "Sign", "FirmwareAttestation", "Erase"},
+    "LockingSP": {"Next", "GetACL", "AddACE", "RemoveACE", "SetACL", "DeleteMethod", "GenKey", "GetPackage", "SetPackage", "RevertSP", "Get", "Set", "CreateTable", "CreateRow", "DeleteRow", "Delete", "DeleteSP", "GetFreeSpace", "GetFreeRows", "Authenticate", "Random", "Erase"},
 }
 
 
-UNSUPPORTED_OPAL_METHODS = {
-    "CreateTable",
-    "DeleteSP",
-    "Delete",
-    "DeleteMethod",
-}
+UNSUPPORTED_OPAL_METHODS: set[str] = set()
 
 
 PIN_COLUMN = 3
+
+
+CPIN_CHARSET_COLUMN = 4
+
+
+CPIN_TRY_LIMIT_COLUMN = 5
+
+
+CPIN_TRIES_COLUMN = 6
+
+
+CPIN_PERSISTENCE_COLUMN = 7
 
 
 MIN_PIN_COLUMN = 0xFFFF0001

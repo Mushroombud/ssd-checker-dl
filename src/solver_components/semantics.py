@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 from typing import Any
 
@@ -147,8 +148,38 @@ def _session_allows_object(state: State, event: Event) -> bool:
     return expected_sp is None or state.session.sp is None or state.session.sp == expected_sp
 
 
+def _implicit_session_sp(state: State, event: Event) -> str | None:
+    if event.sp is not None:
+        return event.sp
+    expected = _expected_object_sp(event, state)
+    if expected is not None:
+        return expected
+    if event.authority in {"SID", "Makers", "PSID", "Anybody"}:
+        return "AdminSP"
+    if event.authority:
+        return "LockingSP"
+    return None
+
+
+def _implicit_session_for_event(state: State, event: Event, *, assume_authenticated: bool = False) -> Session:
+    authenticated = {"Anybody"}
+    if assume_authenticated and event.authority not in {None, "Anybody", "Admins", "Users", "Makers"}:
+        authenticated.add(event.authority)
+    return Session(open=True, sp=_implicit_session_sp(state, event), write=True, authenticated=authenticated)
+
+
 def _method_supported_in_session(state: State, event: Event) -> bool:
-    if event.method in {"Properties", "StartSession", "EndSession", "CloseSession", "SyncSession"}:
+    if event.method in {
+        "Properties",
+        "StartSession",
+        "StartTrustedSession",
+        "StartTlsSession",
+        "EndSession",
+        "CloseSession",
+        "SyncSession",
+        "SyncTrustedSession",
+        "SyncTlsSession",
+    }:
         return True
     if not state.session.open:
         return True
@@ -160,7 +191,7 @@ def _disabled_sp_response(state: State, event: Event) -> ExpectedResponse | None
     sp = state.session.sp
     if not state.session.open or sp is None or state.sp_enabled.get(sp, True):
         return None
-    if event.method in {"Authenticate", "EndSession", "CloseSession", "SyncSession"}:
+    if event.method in {"Authenticate", "DeleteSP", "EndSession", "CloseSession", "SyncSession", "SyncTrustedSession", "SyncTlsSession"}:
         return None
     if event.method == "Set" and event.invoking_symbol == "SPInfo" and set(event.values) == {6}:
         if _is_bool_literal(event.values[6]) and _as_bool(event.values[6]):
@@ -248,7 +279,7 @@ def _ace_datastore_grant(symbol: str) -> str | None:
         return None
     if match.group(1) == "00":
         return "read"
-    if match.group(1) == "01":
+    if match.group(1) in {"01", "02"}:
         return "write"
     return None
 
@@ -276,6 +307,8 @@ def _extract_authorities(node: Any) -> set[str]:
         else:
             uid = _clean_uid(value)
             authority = _authority_by_uid(uid)
+            if uid == "0000000900030000":
+                authorities.add("User1")
             if authority is None:
                 authority = _authority_by_name(value)
             if authority is not None:
@@ -614,7 +647,8 @@ def _range_values_invalid_for_geometry(state: State, range_id: int | None, value
         if 3 in values and start and (start - lowest) % granularity:
             return True
         if 4 in values and length:
-            if length % granularity:
+            length_alignment = (length - lowest) % granularity if start == 0 else length % granularity
+            if length_alignment:
                 return True
 
     if non_global and (creating or 3 in values or 4 in values) and _range_values_overlap(state, range_id, start, length):
@@ -713,6 +747,87 @@ def _range_id_from_delete_uid(uid: str) -> int | None:
     return _range_id_from_symbol(_object_by_uid(uid))
 
 
+def _byte_table_ref_invalid(value: Any) -> bool:
+    uid = _clean_uid(value)
+    if uid in {"", "0000000000000000"}:
+        return False
+    symbol, uid_from_ref = _object_ref_from_value(value)
+    return not (_is_byte_table_uid(uid_from_ref or uid) or _is_byte_table_symbol(symbol))
+
+
+def _set_effective_event(event: Event) -> tuple[Event, ExpectedResponse | None]:
+    where_found, where_value = _named_method_arg_value(event, "Where", "where")
+    symbol = event.invoking_symbol
+    if _is_byte_table_symbol(symbol):
+        if _byte_table_where_invalid(event):
+            return event, ExpectedResponse(
+                {INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="Byte-table Set Where must use row addressing",
+                confidence="high",
+            )
+        return event, None
+
+    if _is_table_symbol(symbol):
+        if not where_found:
+            return event, ExpectedResponse(
+                {INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="Table.Set on an object table requires a Where UID",
+                confidence="high",
+            )
+        row_symbol, row_uid = _object_ref_from_value(where_value)
+        if not row_symbol and not row_uid:
+            return event, ExpectedResponse(
+                {INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="Table.Set Where must identify an object-table row",
+                confidence="high",
+            )
+        if _next_where_invalid(event):
+            return event, ExpectedResponse(
+                {INVALID_PARAMETER, FAIL},
+                forbidden_statuses={SUCCESS},
+                reason="Table.Set Where must reference a row in the invoking object table",
+                confidence="high",
+            )
+        if not row_symbol and row_uid:
+            row_symbol = _object_by_uid(row_uid)
+        return replace(event, invoking_symbol=row_symbol, invoking_uid=row_uid, invoking_name=row_symbol), None
+
+    if where_found:
+        return event, ExpectedResponse(
+            {INVALID_PARAMETER, FAIL},
+            forbidden_statuses={SUCCESS},
+            reason="Object.Set must omit Where",
+            confidence="high",
+        )
+    return event, None
+
+
+def _set_values_omitted(event: Event) -> bool:
+    if _is_byte_table_symbol(event.invoking_symbol):
+        return False
+    if event.values or _byte_table_has_payload(event):
+        return False
+    found, value = _named_method_arg_value(
+        event,
+        "Values",
+        "values",
+        "RowValues",
+        "rowValues",
+        "Bytes",
+        "bytes",
+        "Data",
+        "data",
+        "Buffer",
+        "BufferIn",
+        "Payload",
+        "payload",
+    )
+    return not found or _empty_payload(value)
+
+
 def _invalid_set_values(state: State, event: Event) -> bool:
     symbol = event.invoking_symbol
     if symbol.startswith("_CertData_"):
@@ -758,7 +873,25 @@ def _invalid_set_values(state: State, event: Event) -> bool:
         return True
     if symbol.startswith("C_PIN_"):
         columns = set(event.values)
-        if not columns or not columns <= {PIN_COLUMN, MIN_PIN_COLUMN}:
+        allowed = {
+            PIN_COLUMN,
+            CPIN_CHARSET_COLUMN,
+            CPIN_TRY_LIMIT_COLUMN,
+            CPIN_TRIES_COLUMN,
+            CPIN_PERSISTENCE_COLUMN,
+            MIN_PIN_COLUMN,
+        }
+        if not columns or not columns <= allowed:
+            return True
+        if CPIN_CHARSET_COLUMN in event.values and _byte_table_ref_invalid(event.values[CPIN_CHARSET_COLUMN]):
+            return True
+        if CPIN_TRY_LIMIT_COLUMN in event.values:
+            try_limit = _parse_int(event.values[CPIN_TRY_LIMIT_COLUMN])
+            if try_limit is None or try_limit < 0:
+                return True
+        if CPIN_TRIES_COLUMN in event.values and _parse_int(event.values[CPIN_TRIES_COLUMN]) != 0:
+            return True
+        if CPIN_PERSISTENCE_COLUMN in event.values and not _is_bool_literal(event.values[CPIN_PERSISTENCE_COLUMN]):
             return True
         if PIN_COLUMN in event.values and event.values[PIN_COLUMN] in {None, ""}:
             return True
@@ -826,6 +959,105 @@ def _invalid_set_values(state: State, event: Event) -> bool:
     return False
 
 
+def _create_table_arg(event: Event, index: int, *names: str) -> tuple[bool, Any]:
+    found, value = _named_method_arg_value(event, *names)
+    if found:
+        return True, value
+    raw_args = _method_raw_args(event)
+    if not isinstance(raw_args, (list, tuple)) or any(_is_named_pair(item) for item in raw_args):
+        return False, None
+    if len(raw_args) <= index:
+        return False, None
+    return True, raw_args[index]
+
+
+def _create_table_name_text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("name", "Name", "value", "Value"):
+            found, item = _dict_lookup(value, key)
+            if found:
+                return _create_table_name_text(item)
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return _create_table_name_text(value[0])
+    return _as_text(value or "").strip()
+
+
+def _create_table_kind(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("kind", "Kind", "name", "Name", "value", "Value"):
+            found, item = _dict_lookup(value, key)
+            if found:
+                kind = _create_table_kind(item)
+                if kind is not None:
+                    return kind
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return _create_table_kind(value[0])
+    parsed = _parse_int(value)
+    if parsed == 1:
+        return "object"
+    if parsed == 2:
+        return "byte"
+    text = re.sub(r"[^A-Za-z0-9]", "", _as_text(value or "")).upper()
+    if text in {"OBJECT", "OBJECTTABLE", "OBJ"}:
+        return "object"
+    if text in {"BYTE", "BYTES", "BYTETABLE"}:
+        return "byte"
+    return None
+
+
+def _create_table_columns_empty(value: Any) -> bool:
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    text = re.sub(r"\s+", "", _as_text(value or ""))
+    return text in {"", "[]", "()", "{}"}
+
+
+def _created_table_for_event(state: State, event: Event) -> tuple[str, str] | None:
+    if not event.invoking_uid:
+        return None
+    return state.created_tables.get(event.invoking_uid)
+
+
+def _is_credential_symbol(symbol: str) -> bool:
+    return bool(
+        _pin_owner_by_object(symbol)
+        or _range_id_from_key(symbol) is not None
+        or symbol in {"TPerSign", "TperAttestation"}
+        or symbol.startswith("TLS_PSK_Key")
+    )
+
+
+def _credential_ref_invalid(value: Any) -> bool:
+    symbol, uid = _object_ref_from_value(value)
+    if not symbol and uid:
+        symbol = _object_by_uid(uid)
+    return not symbol or not _is_credential_symbol(symbol)
+
+
+def _package_credential_arg_invalid(event: Event, *names: str) -> bool:
+    found, value = _named_method_arg_value(event, *names)
+    if not found:
+        return False
+    return _credential_ref_invalid(value)
+
+
+def _package_required_authorities(state: State, event: Event) -> set[str]:
+    owner = _pin_owner_by_object(event.invoking_symbol)
+    if owner == "SID":
+        return {"Admins", "SID"}
+    if owner and owner.startswith("Admin"):
+        return {"Admins", owner, "SID"}
+    if owner and owner.startswith("User"):
+        return {"Admins", owner}
+    if owner and (owner == "EraseMaster" or owner.startswith("BandMaster")):
+        return {"Admins", owner, "SID"}
+    if _range_id_from_key(event.invoking_symbol) is not None:
+        return {"Admins"}
+    if event.invoking_symbol.startswith("TLS_PSK_Key"):
+        return {"Admins", "SID"} if state.session.sp == "AdminSP" else {"Admins", "EraseMaster"}
+    return {"Admins"}
+
+
 def _table_method_common_failure(state: State, event: Event, method: str) -> ExpectedResponse | None:
     if not state.session.open:
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{method} requires an open session", confidence="high")
@@ -833,6 +1065,14 @@ def _table_method_common_failure(state: State, event: Event, method: str) -> Exp
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{method} requires a read-write session", confidence="high")
     if not _session_allows_object(state, event):
         return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{method} table does not belong to current SP", confidence="medium")
+    created = _created_table_for_event(state, event)
+    if created is not None:
+        table_sp, kind = created
+        if state.session.sp is not None and table_sp != state.session.sp:
+            return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{method} dynamic table does not belong to current SP", confidence="high")
+        if kind == "byte":
+            return ExpectedResponse({INVALID_PARAMETER}, reason=f"{method} is not available on byte tables", confidence="high")
+        return None
     if not _is_table_symbol(event.invoking_symbol):
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, reason=f"{method} is a table method", confidence="high")
     if event.invoking_symbol in {"MBR", "DataStore"} or event.invoking_symbol.startswith("DataStore"):
@@ -845,6 +1085,14 @@ def _table_query_common_failure(state: State, event: Event, method: str) -> Expe
         return ExpectedResponse({NOT_AUTHORIZED}, reason=f"{method} requires an open session", confidence="high")
     if not _session_allows_object(state, event):
         return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{method} table does not belong to current SP", confidence="medium")
+    created = _created_table_for_event(state, event)
+    if created is not None:
+        table_sp, kind = created
+        if state.session.sp is not None and table_sp != state.session.sp:
+            return ExpectedResponse({NOT_AUTHORIZED, INVALID_PARAMETER}, reason=f"{method} dynamic table does not belong to current SP", confidence="high")
+        if kind == "byte":
+            return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason=f"{method} is defined for Opal object tables", confidence="high")
+        return None
     if not _is_table_symbol(event.invoking_symbol) or _is_byte_table_symbol(event.invoking_symbol):
         return ExpectedResponse({INVALID_PARAMETER, FAIL}, forbidden_statuses={SUCCESS}, reason=f"{method} is defined for Opal object tables", confidence="high")
     return None
@@ -972,7 +1220,7 @@ def _get_arg_uid(event: Event, *names: str) -> str:
     return ""
 
 
-def _combo_exists_for_get_acl(state: State, event: Event) -> bool | None:
+def _access_control_combo_key(event: Event) -> tuple[str, str] | None:
     found_invoking, invoking_value = _named_method_arg_value(event, "InvokingID", "InvokingId", "Object", "ObjectID", "Table", "TableUID")
     found_method, method_value = _named_method_arg_value(event, "MethodID", "MethodId", "Method")
     if not found_invoking and not found_method:
@@ -982,6 +1230,32 @@ def _combo_exists_for_get_acl(state: State, event: Event) -> bool | None:
     method_name = _method_ref_name(method_value)
     if method_name is None:
         return None
+    if not symbol and invoking_uid:
+        symbol = _object_by_uid(invoking_uid)
+    return (symbol or invoking_uid, method_name)
+
+
+def _event_method_combo_key(event: Event) -> tuple[str, str]:
+    return (event.invoking_symbol or event.invoking_uid, event.method)
+
+
+def _method_combo_deleted(state: State, event: Event) -> bool:
+    return _event_method_combo_key(event) in state.deleted_method_associations
+
+
+def _combo_exists_for_get_acl(state: State, event: Event) -> bool | None:
+    combo_key = _access_control_combo_key(event)
+    found_invoking, invoking_value = _named_method_arg_value(event, "InvokingID", "InvokingId", "Object", "ObjectID", "Table", "TableUID")
+    found_method, method_value = _named_method_arg_value(event, "MethodID", "MethodId", "Method")
+    if not found_invoking and not found_method:
+        return None
+
+    symbol, invoking_uid = _object_ref_from_value(invoking_value) if found_invoking else ("", "")
+    method_name = _method_ref_name(method_value)
+    if method_name is None:
+        return None
+    if combo_key in state.deleted_method_associations:
+        return False
     if method_name == "SPTemplatesObj":
         return state.session.sp == "LockingSP" and (symbol.startswith("SPTemplates_") or invoking_uid.startswith("00000003"))
     if method_name == "MethodIDObj":
@@ -1000,12 +1274,20 @@ def _combo_exists_for_get_acl(state: State, event: Event) -> bool | None:
         return _is_table_symbol(symbol) and symbol not in {"MBR", "DataStore", "MethodIDTable", "Table_MethodID", "AccessControlTable", "Table_AccessControl"}
     if method_name == "DeleteRow":
         return _is_table_symbol(symbol) and symbol not in {"MBR", "DataStore", "MethodIDTable", "Table_MethodID", "AccessControlTable", "Table_AccessControl"}
-    if method_name in {"GetFreeSpace", "GetFreeRows"}:
+    if method_name == "GetFreeSpace":
+        return symbol in {"ThisSP", "AdminSP", "LockingSP"} or symbol.startswith("UnknownSP_")
+    if method_name == "CreateTable":
+        return symbol in {"ThisSP", state.session.sp}
+    if method_name == "DeleteSP":
+        return symbol in {"ThisSP", state.session.sp}
+    if method_name == "GetFreeRows":
         return _is_table_symbol(symbol) and not _is_byte_table_symbol(symbol)
     if method_name in {"AddACE", "RemoveACE", "SetACL"}:
         return symbol in {"AccessControlTable", "Table_AccessControl", "AccessControl"}
     if method_name == "GenKey":
         return _range_id_from_key(symbol) is not None
+    if method_name in {"GetPackage", "SetPackage"}:
+        return _is_credential_symbol(symbol)
     if method_name == "Erase":
         range_id = _range_id_from_symbol(symbol)
         return range_id is not None and range_id != 0

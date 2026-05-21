@@ -1,6 +1,6 @@
 import unittest
 
-from src.solver import predict_trajectory
+from src.solver import _return_bool, parse_event, predict_trajectory
 
 
 SID = "0000000900000006"
@@ -104,6 +104,22 @@ def host_reset(command="PowerCycle"):
     }
 
 
+def host_write_top_level(pattern="8E", start_lba="0x80", num_blocks=8):
+    return {
+        "type": "Write",
+        "input": {"start_lba": start_lba, "num_blocks": num_blocks, "data": pattern},
+        "output": {"status": "SUCCESS"},
+    }
+
+
+def host_read_top_level(result, start_lba="0x80", num_blocks=8):
+    return {
+        "type": "Read",
+        "input": {"start_lba": start_lba, "num_blocks": num_blocks},
+        "output": {"data": result},
+    }
+
+
 def owned_admin_context():
     return [
         start_session(ADMIN_SP),
@@ -145,6 +161,37 @@ class SolverRuleTests(unittest.TestCase):
         record = method_record("unused", "0000000B00008402", "C_PIN", "SUCCESS", return_values=[[{"3": "MSID"}]])
         record["input"]["method"] = "0000000600000006"
         trajectory = [start_session(ADMIN_SP), record]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_session_manager_method_uid_without_name_is_mapped(self):
+        record = start_session(ADMIN_SP)
+        record["input"]["method"] = {"uid": "000000000000FF02", "args": record["input"]["method"]["args"]}
+        self.assertEqual(predict_trajectory([record]), "PASS")
+
+    def test_session_manager_properties_uid_without_name_is_mapped(self):
+        record = method_record("unused", "00000000000000FF", "SMUID", "SUCCESS")
+        record["input"]["method"] = {"uid": "000000000000FF01", "args": []}
+        self.assertEqual(predict_trajectory([record]), "PASS")
+
+    def test_start_trusted_session_requires_open_session(self):
+        trajectory = [method_record("StartTrustedSession", "00000000000000FF", "Session Manager UID", "SUCCESS")]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_start_trusted_session_rejects_non_session_manager_target_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("StartTrustedSession", "0000020500000001", "AdminSP", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_start_trusted_session_preserves_existing_session(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("StartTrustedSession", "00000000000000FF", "Session Manager UID", "SUCCESS"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"3": "trustedpin"}]}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "trustedpin"),
+        ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
     def test_tcg_output_result_is_used_as_status_when_status_field_missing(self):
@@ -241,6 +288,26 @@ class SolverRuleTests(unittest.TestCase):
         trajectory = owned_admin_context() + [record]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_start_session_positional_auth_rejects_wrong_challenge_success(self):
+        record = raw_method_record(
+            "StartSession",
+            "00000000000000FF",
+            "Session Manager UID",
+            args=[100, ADMIN_SP_INT, 1, "wrong", SID],
+        )
+        trajectory = owned_admin_context() + [record]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_start_session_positional_auth_accepts_authority_before_challenge(self):
+        record = raw_method_record(
+            "StartSession",
+            "00000000000000FF",
+            "Session Manager UID",
+            args=[100, ADMIN_SP_INT, 1, SID, "new"],
+        )
+        trajectory = owned_admin_context() + [record]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_start_session_positional_write_flag_controls_later_set(self):
         record = raw_method_record(
             "StartSession",
@@ -251,6 +318,10 @@ class SolverRuleTests(unittest.TestCase):
         trajectory = [record, method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"3": "new"}]})]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_start_session_rejects_class_authority_success(self):
+        record = start_session(ADMIN_SP, "Admins", "new")
+        self.assertEqual(predict_trajectory([record]), "FAIL")
+
     def test_authenticate_accepts_plaintext_challenge_object(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP),
@@ -258,6 +329,42 @@ class SolverRuleTests(unittest.TestCase):
             method_record("Set", "0000000B00000001", "C_PIN", optional={"Values": [{"3": "newer"}]}),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_authenticate_wrong_pin_success_false_is_valid(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP),
+            method_record("Authenticate", "0000000000000001", "ThisSP", "SUCCESS", required={"Authority": "SID", "Challenge": "wrong"}, return_values=[False]),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_authenticate_wrong_pin_success_true_is_invalid(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP),
+            method_record("Authenticate", "0000000000000001", "ThisSP", "SUCCESS", required={"Authority": "SID", "Challenge": "wrong"}, return_values=[True]),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_authenticate_positional_wrong_challenge_success_true_is_invalid(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP),
+            raw_method_record("Authenticate", "0000000000000001", "ThisSP", "SUCCESS", args=["wrong", SID], return_values=[True]),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_authenticate_positional_authority_before_challenge_is_valid(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP),
+            raw_method_record("Authenticate", "0000000000000001", "ThisSP", "SUCCESS", args=[SID, "new"], return_values=[True]),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_authenticate_success_false_does_not_authorize_context(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP),
+            method_record("Authenticate", "0000000000000001", "ThisSP", "SUCCESS", required={"Authority": "SID", "Challenge": "wrong"}, return_values=[False]),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"3": "newer"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
     def test_authenticate_accepts_authas_tuple_credential(self):
         trajectory = owned_admin_context() + [
@@ -434,6 +541,10 @@ class SolverRuleTests(unittest.TestCase):
         trajectory = owned_admin_context() + [record]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_enterprise_locking_sp_session_does_not_require_activate(self):
+        trajectory = [start_session("0000020500010001")]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_bytes_named_msid_pin_return_updates_sid_pin(self):
         trajectory = [
             start_session(ADMIN_SP),
@@ -464,6 +575,488 @@ class SolverRuleTests(unittest.TestCase):
             start_session(ADMIN_SP, SID, "new"),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_cpin_alias_uid_without_name_updates_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            method_record("Set", "0000000900000001", "", optional={"Values": [{"3": "new"}]}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_short_admin1_object_uid_maps_to_admin_pin(self):
+        event = parse_event(method_record("Set", "00000000B0001000", "", optional={"Values": [{"3": "adminpin"}]}))
+        self.assertEqual(event.invoking_symbol, "C_PIN_Admin1")
+
+    def test_flattened_method_schema_updates_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            {
+                "method_name": "Set",
+                "object": {"uid": "0000000B00000001", "name": "C_PIN"},
+                "required_args": {},
+                "optional_args": {"Values": [{"3": "new"}]},
+                "status": "SUCCESS",
+            },
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_top_level_named_method_fields_update_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            {
+                "input": {
+                    "method_name": "Set",
+                    "object": {"uid": "0000000B00000001", "name": "C_PIN"},
+                    "PIN": "new",
+                },
+                "output": {"status": "SUCCESS"},
+            },
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_nonamed_set_tuple_updates_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            raw_method_record("Set", "0000000B00000001", "C_PIN", args=(1, [(3, "new")])),
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_invoke_argv_kwargs_updates_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            {
+                "input": {
+                    "argv": ["C_PIN_SID", "Set", (1, [(3, "new")])],
+                    "kwargs": {"sp": "AdminSP", "authAs": ("SID", "old"), "noNamed": True},
+                },
+                "output": {"return": [0, [], {}]},
+            },
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_kwargs_merge_with_normalized_method_args(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            {
+                "input": {
+                    "method": {"name": "Set", "args": []},
+                    "invoking_id": {"uid": "0000000B00000001", "name": "C_PIN"},
+                    "kwargs": {"PIN": "new", "authAs": ("SID", "old")},
+                },
+                "output": {"status_codes": "SUCCESS"},
+            },
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_function_invoke_args_kwargs_update_pin_state(self):
+        trajectory = owned_admin_context()[:-2] + [
+            start_session(ADMIN_SP, SID, "old"),
+            {
+                "input": {
+                    "function": "invoke",
+                    "args": ["C_PIN_SID", "Set", (1, [(3, "new")])],
+                    "kwargs": {"sp": "AdminSP", "authAs": ("SID", "old"), "noNamed": True},
+                },
+                "output": {"return": [0, [], {}]},
+            },
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_standalone_invoke_target_uses_scoped_session(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {
+                    "function": "invoke",
+                    "args": ["C_PIN_SID", "Set", (1, [(3, "newer")])],
+                    "kwargs": {"sp": "AdminSP", "authAs": ("SID", "new"), "noNamed": True},
+                },
+                "output": {"return": [0, [], {}]},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_standalone_invoke_rejects_wrong_auth_success(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {
+                    "function": "invoke",
+                    "args": ["C_PIN_SID", "Set", (1, [(3, "newer")])],
+                    "kwargs": {"sp": "AdminSP", "authAs": ("SID", "wrong"), "noNamed": True},
+                },
+                "output": {"return": [0, [], {}]},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_standalone_invoke_context_updates_state(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {
+                    "function": "invoke",
+                    "args": ["C_PIN_SID", "Set", (1, [(3, "newer")])],
+                    "kwargs": {"sp": "AdminSP", "authAs": ("SID", "new"), "noNamed": True},
+                },
+                "output": {"return": [0, [], {}]},
+            },
+            start_session(ADMIN_SP, SID, "newer"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_invoke_return_tuple_yields_return_values(self):
+        event = parse_event(
+            {
+                "input": {"argv": ["ThisSP", "Authenticate", SID, ("0", "new")], "kwargs": {"sp": "AdminSP"}},
+                "output": {"return": [0, [1], {}]},
+            }
+        )
+        self.assertEqual(event.method, "Authenticate")
+        self.assertEqual(event.status, "SUCCESS")
+        self.assertIs(_return_bool(event.raw), True)
+
+    def test_tcgstorageapi_checkpin_correct_pin_returns_true(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "checkPIN", "args": ["SID", "new"]},
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_checkpin_wrong_pin_returning_true_is_invalid(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "checkPIN", "args": ["SID", "wrong"]},
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_checkpin_wrong_pin_returning_false_is_valid(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "_checkPIN", "args": ["SID", "wrong"]},
+                "output": {"return": False},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_change_pin_updates_state(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "changePIN", "args": ["SID", "newer"], "kwargs": {"authAs": ("SID", "new")}},
+                "output": {"return": True},
+            },
+            start_session(ADMIN_SP, SID, "newer"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_change_pin_wrong_auth_true_is_invalid(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "changePIN", "args": ["SID", "newer"], "kwargs": {"authAs": ("SID", "wrong")}},
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_failure_callback_none_counts_as_failure(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "changePIN", "args": ["SID", "newer"], "kwargs": {"authAs": ("SID", "wrong")}},
+                "output": {"return": None},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_set_range_updates_lock_state(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {
+                    "function": "setRange",
+                    "args": ["Admin1", 1],
+                    "kwargs": {"authAs": ("Admin1", "new"), "RangeStart": 0, "RangeLength": 1024, "WriteLockEnabled": True, "WriteLocked": True},
+                },
+                "output": {"return": True},
+            },
+            end_session(),
+            host_write_status("SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_random_accepts_payload_return(self):
+        trajectory = [
+            {
+                "input": {"function": "random", "args": [4]},
+                "output": {"return": b"abcd"},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_random_rejects_wrong_length_payload(self):
+        trajectory = [
+            {
+                "input": {"function": "random", "args": [4]},
+                "output": {"return": b"abc"},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_enable_authority_updates_state(self):
+        trajectory = owned_admin_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            {
+                "input": {"function": "enableAuthority", "args": ["User1", True], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+            method_record("Set", "", "C_PIN_User1", optional={"authAs": ("Admin1", "new"), "PIN": "userpin"}),
+            end_session(),
+            start_session(LOCKING_SP, "User1", "userpin"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_set_port_maps_to_adminsp_set(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {"function": "setPort", "args": ["Port2"], "kwargs": {"authAs": ("SID", "new"), "PortLocked": True}},
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_tpersign_rejects_oversized_payload(self):
+        trajectory = [
+            {
+                "input": {"function": "tperSign", "args": ["A" * 257]},
+                "output": {"return": b"signature"},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_firmware_attestation_requires_nonce(self):
+        trajectory = [
+            {
+                "input": {"function": "firmware_attestation", "args": []},
+                "output": {"return": [b"attestation"]},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_firmware_attestation_accepts_nonce(self):
+        trajectory = [
+            {
+                "input": {"function": "firmware_attestation", "args": [b"0" * 16]},
+                "output": {"return": [b"attestation"]},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_cert_get_maps_to_byte_table_get(self):
+        trajectory = [
+            {
+                "input": {"function": "get_tperAttestation_Cert", "args": []},
+                "output": {"return": bytearray(b"cert")},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_tpersign_cert_get_maps_to_byte_table_get(self):
+        trajectory = [
+            {
+                "input": {"function": "get_tperSign_cert", "args": []},
+                "output": {"return": bytearray(b"cert")},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_writeaccess_allows_user_datastore_write(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000000900030001", "Authority", optional={"Values": [{"5": 1}]}),
+            method_record("Set", "0000000B00030001", "C_PIN", optional={"Values": [{"3": "userpin"}]}),
+            {
+                "input": {"function": "writeaccess", "args": ["User1", 1], "kwargs": {"authAs": ("Admin1", "new")}},
+                "output": {"return": True},
+            },
+            end_session(),
+            start_session(LOCKING_SP, "User1", "userpin"),
+            {
+                "input": {"function": "writeData", "args": ["User1", {"hello": "world"}], "kwargs": {"authAs": ("User1", "userpin")}},
+                "output": {"return": True},
+            },
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_set_psk_entry_accepts_sid_auth(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {
+                    "function": "setPskEntry",
+                    "args": [0],
+                    "kwargs": {"authAs": ("SID", "new"), "Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
+                },
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_set_psk_entry_rejects_wrong_sid_auth(self):
+        trajectory = owned_admin_context() + [
+            {
+                "input": {
+                    "function": "setPskEntry",
+                    "args": [0],
+                    "kwargs": {"authAs": ("SID", "wrong"), "Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
+                },
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_set_psk_entry_rejects_wrong_second_auth(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {
+                    "function": "setPskEntry",
+                    "args": [0],
+                    "kwargs": {"authAs": [("SID", "new"), ("Admin1", "wrong")], "Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
+                },
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_set_psk_entry_accepts_two_valid_auths(self):
+        trajectory = activated_locking_context() + [
+            {
+                "input": {
+                    "function": "setPskEntry",
+                    "args": [0],
+                    "kwargs": {"authAs": [("SID", "new"), ("Admin1", "new")], "Enabled": False, "PSK": b"secret", "CipherSuite": "0x1301"},
+                },
+                "output": {"return": True},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_lockinginfo_updates_alignment_state(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            {
+                "input": {"function": "lockingInfo", "args": []},
+                "output": {"return": {"AlignmentRequired": 1, "AlignmentGranularity": 8, "LowestAlignedLBA": 4}},
+            },
+            method_record("Set", "0000080200030001", "Locking", "SUCCESS", optional={"Values": [{"3": 4}, {"4": 12}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_high_level_tcgreset_closes_session_without_factory_reset(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            {"input": {"function": "tcgReset", "args": []}, "output": {"return": True}},
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_high_level_tcgreset_does_not_clear_credentials(self):
+        trajectory = owned_admin_context() + [
+            {"input": {"function": "tcgReset", "args": []}, "output": {"return": True}},
+            start_session(ADMIN_SP, SID, "old"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_host_property_false_value_is_not_a_tcg_failure(self):
+        trajectory = [
+            {
+                "input": {"function": "hasLockedRange", "args": []},
+                "output": {"return": False},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_host_helper_use_psk_is_not_a_tcg_method(self):
+        trajectory = [
+            {
+                "input": {"function": "usePsk", "args": ["TLS_PSK_Key1", "TLS_AES_128_GCM_SHA256", b"psk"]},
+                "output": {"return": None},
+            }
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_tcgstorageapi_msid_property_seeds_factory_sid_credential(self):
+        trajectory = [
+            {
+                "input": {"function": "mSID", "args": []},
+                "output": {"return": "factory"},
+            },
+            start_session(ADMIN_SP, SID, "wrong"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_enterprise_locking_range_uid_without_name_updates_lock_state(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record(
+                "Set",
+                "0000080200000002",
+                "",
+                optional={"Values": [{"3": 0}, {"4": 1024}, {"6": 1}, {"8": 1}]},
+            ),
+            end_session(),
+            host_write_status("SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_nonamed_set_tuple_updates_lock_state(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            raw_method_record(
+                "Set",
+                "0000080200030001",
+                "Locking",
+                args=(1, [(3, 0), (4, 1024), (6, 1), (8, 1)]),
+            ),
+            end_session(),
+            host_write_status("SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_port_base_uid_without_name_uses_port_columns(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0001000200000002", "", "SUCCESS", optional={"Values": [{"3": "locked"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_tcgstorageapi_bandmaster_alias_prefers_supplied_name(self):
+        event = parse_event(method_record("Set", "0000000900008002", "C_PIN_BandMaster1", optional={"Values": [{"3": "pin"}]}))
+        self.assertEqual(event.invoking_symbol, "C_PIN_BandMaster1")
+
+    def test_tcgstorageapi_bandmaster_authority_prefers_supplied_name(self):
+        record = start_session(ADMIN_SP, {"uid": "0000000900008002", "name": "BandMaster1"}, "pin")
+        event = parse_event(record)
+        self.assertEqual(event.authority, "BandMaster1")
+
+    def test_tcgstorageapi_bandmaster_uid_without_name_uses_lookupids_numbering(self):
+        event = parse_event(method_record("Set", "0000000900008002", "", optional={"Values": [{"3": "pin"}]}))
+        self.assertEqual(event.invoking_symbol, "C_PIN_BandMaster1")
+
+    def test_tcgstorageapi_bandmaster_cpin_uid_without_name_uses_lookupids_numbering(self):
+        event = parse_event(method_record("Set", "0000000B00008002", "", optional={"Values": [{"3": "pin"}]}))
+        self.assertEqual(event.invoking_symbol, "C_PIN_BandMaster1")
 
     def test_named_pin_argument_updates_pin_state(self):
         trajectory = owned_admin_context()[:-2] + [
@@ -520,6 +1113,142 @@ class SolverRuleTests(unittest.TestCase):
         record = method_record("CreateTable", "0000000000000001", "ThisSP", "StatusCode.Obsolete")
         trajectory = [start_session(ADMIN_SP), record]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_create_table_object_accepts_required_args(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Audit", "Kind": 1, "GetSetACL": [], "Columns": [["Entry", "uid"]], "MinSize": 0},
+                return_values={"UID": "0000010000000001", "Rows": 0},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_create_table_requires_admins(self):
+        trajectory = [
+            start_session(ADMIN_SP),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Audit", "Kind": 1, "GetSetACL": [], "Columns": [], "MinSize": 0},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_create_table_missing_required_arg_rejects_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Audit", "Kind": 1, "Columns": [], "MinSize": 0},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_create_table_byte_requires_empty_columns(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Blob", "Kind": "Byte", "GetSetACL": [], "Columns": [["Entry", "uid"]], "MinSize": 16},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_create_table_byte_rejects_max_size(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Blob", "Kind": 2, "GetSetACL": [], "Columns": [], "MinSize": 16},
+                optional={"MaxSize": 32},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_create_table_duplicate_name_common_name_rejects_success(self):
+        args = {"NewTableName": "Audit", "Kind": 1, "GetSetACL": [], "Columns": [], "MinSize": 0}
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("CreateTable", "0000000000000001", "ThisSP", "SUCCESS", required=args, optional={"CommonName": "Base"}, return_values={"UID": "0000010000000001"}),
+            method_record("CreateTable", "0000000000000001", "ThisSP", "SUCCESS", required=args, optional={"CommonName": "Base"}, return_values={"UID": "0000010000000002"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_created_object_table_get_free_rows_is_allowed(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Audit", "Kind": 1, "GetSetACL": [], "Columns": [], "MinSize": 0},
+                return_values={"UID": "0000010000000001"},
+            ),
+            method_record("GetFreeRows", "0000010000000001", "", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_created_object_table_create_row_is_allowed(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Audit", "Kind": 1, "GetSetACL": [], "Columns": [["Entry", "uid"]], "MinSize": 0},
+                return_values={"UID": "0000010000000001"},
+            ),
+            method_record("CreateRow", "0000010000000001", "", "SUCCESS", optional={"Values": [{"1": "row"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_created_object_table_delete_row_requires_rows(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Audit", "Kind": 1, "GetSetACL": [], "Columns": [], "MinSize": 0},
+                return_values={"UID": "0000010000000001"},
+            ),
+            method_record("DeleteRow", "0000010000000001", "", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_created_byte_table_get_free_rows_rejects_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "CreateTable",
+                "0000000000000001",
+                "ThisSP",
+                "SUCCESS",
+                required={"NewTableName": "Blob", "Kind": 2, "GetSetACL": [], "Columns": [], "MinSize": 16},
+                return_values={"UID": "0000010000000002"},
+            ),
+            method_record("GetFreeRows", "0000010000000002", "", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
     def test_failed_credential_update_does_not_change_pin(self):
         trajectory = owned_admin_context()[:-2] + [
@@ -669,12 +1398,104 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_object_set_rejects_where_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Where": "0000000B00000001", "Values": [{"3": "newer"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_table_set_with_where_updates_pin_state(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000000", "C_PIN", "SUCCESS", optional={"Where": "0000000B00000001", "Values": [{"3": "tablepin"}]}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "tablepin"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_table_set_rejects_wrong_where_family_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000000", "C_PIN", "SUCCESS", optional={"Where": "0000080200000001", "Values": [{"3": "newer"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_table_set_rejects_cross_sp_row_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000000", "C_PIN", "SUCCESS", optional={"Where": "0000000B00030001", "Values": [{"3": "userpin"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_table_set_without_values_succeeds_with_no_effect(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000000", "C_PIN", "SUCCESS", optional={"Where": "0000000B00000001"}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "new"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_min_pin_length_set_is_allowed_for_cpin(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP, SID, "new"),
             method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"0xFFFF0001": 4}]}),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_cpin_try_limit_set_is_allowed(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"5": 2}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_cpin_try_limit_rejects_negative_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"5": -1}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_cpin_tries_only_allows_reset_to_zero(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"6": 0}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_cpin_tries_rejects_nonzero_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"6": 1}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_cpin_persistence_requires_boolean(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"7": "sticky"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_cpin_charset_accepts_null_uid(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"4": "0000000000000000"}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_try_limit_locks_out_start_session_after_failures(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("Set", "0000000B00000001", "C_PIN", "SUCCESS", optional={"Values": [{"5": 2}]}),
+            end_session(),
+            start_session(ADMIN_SP, SID, "wrong", "NOT_AUTHORIZED"),
+            start_session(ADMIN_SP, SID, "wrong", "NOT_AUTHORIZED"),
+            start_session(ADMIN_SP, SID, "new", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
     def test_min_pin_length_over_cpin_max_rejects_success(self):
         trajectory = owned_admin_context() + [
@@ -1092,19 +1913,19 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
-    def test_get_free_space_accepts_opal_object_table(self):
+    def test_get_free_space_rejects_object_table_success(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP),
             method_record("GetFreeSpace", "0000000B00000000", "C_PIN", "SUCCESS"),
         ]
-        self.assertEqual(predict_trajectory(trajectory), "PASS")
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
-    def test_get_free_space_rejects_sp_object_success(self):
+    def test_get_free_space_accepts_thissp(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP),
             method_record("GetFreeSpace", "0000000000000001", "ThisSP", "SUCCESS"),
         ]
-        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
 
     def test_get_free_rows_accepts_opal_object_table(self):
         trajectory = owned_admin_context() + [
@@ -1142,10 +1963,103 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_genkey_requires_write_session(self):
+        trajectory = activated_locking_context() + [
+            raw_method_record("StartSession", "00000000000000FF", "Session Manager UID", args=[100, LOCKING_SP_INT, 0]),
+            method_record("GenKey", "0000080600030001", "K_AES_256", "SUCCESS", optional={"authAs": ("Admin1", "new")}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_cpin_genkey_accepts_pin_length(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("GenKey", "0000000B00000001", "C_PIN", "SUCCESS", optional={"PinLength": 16}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_cpin_genkey_rejects_pin_length_over_32_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("GenKey", "0000000B00000001", "C_PIN", "SUCCESS", optional={"PinLength": 33}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_cpin_genkey_rejects_public_exponent_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("GenKey", "0000000B00000001", "C_PIN", "SUCCESS", optional={"PublicExponent": 65537}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_get_package_accepts_credential_with_purpose(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("GetPackage", "0000000B00000001", "C_PIN_SID", "SUCCESS", required={"Purpose": "backup"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_get_package_requires_purpose(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("GetPackage", "0000000B00000001", "C_PIN_SID", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_get_package_rejects_invalid_wrapping_key_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("GetPackage", "0000000B00000001", "C_PIN_SID", "SUCCESS", required={"Purpose": "backup"}, optional={"WrappingKey": "0000080100000000"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_set_package_accepts_credential_value(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("SetPackage", "0000000B00000001", "C_PIN_SID", "SUCCESS", required={"Value": "package"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_set_package_requires_read_write_session(self):
+        readonly_start = start_session(ADMIN_SP, SID, "new")
+        readonly_start["input"]["method"]["args"]["required"]["Write"] = 0
+        trajectory = owned_admin_context() + [
+            readonly_start,
+            method_record("SetPackage", "0000000B00000001", "C_PIN_SID", "SUCCESS", required={"Value": "package"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_set_package_rejects_non_credential_target_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("SetPackage", "0000080100000000", "LockingInfo", "SUCCESS", required={"Value": "package"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_k_aes_genkey_rejects_pin_length_success(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("GenKey", "0000080600030001", "K_AES_256", "SUCCESS", optional={"PinLength": 16}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_read_subrange_matches_prior_written_pattern(self):
         trajectory = activated_locking_context() + [
             host_write("8E", lba="80 ~ 87"),
             host_read("Pattern 8E", lba="82 ~ 83"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_top_level_host_io_schema_tracks_lba_pattern(self):
+        trajectory = activated_locking_context() + [
+            host_write_top_level("8E"),
+            host_read_top_level("8E"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_host_io_bytes_payloads_track_lba_pattern(self):
+        trajectory = activated_locking_context() + [
+            host_write_top_level(b"\x8e"),
+            host_read_top_level([0x8E]),
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
@@ -1827,6 +2741,30 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_datastore_write_ace_accepts_tcgstorageapi_uid_only_table_one(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000000900030001", "Authority", optional={"Values": [{"5": 1}]}),
+            method_record("Set", "0000000B00030001", "C_PIN", optional={"Values": [{"3": "userpin"}]}),
+            method_record("Set", "000000080003FC02", "ACE", optional={"Values": [{"3": ["0000000900030001"]}]}),
+            end_session(),
+            start_session(LOCKING_SP, "0000000900030001", "userpin"),
+            method_record("Set", "0000100100000000", "DataStore", "SUCCESS", optional={"Bytes": "AA"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_range_access_ace_accepts_tcgstorageapi_zero_user_uid(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000000900030001", "Authority", optional={"Values": [{"5": 1}]}),
+            method_record("Set", "0000000B00030001", "C_PIN", optional={"Values": [{"3": "userpin"}]}),
+            method_record("Set", "000000080003E001", "ACE", optional={"Values": [{"3": ["0000000900030000"]}]}),
+            end_session(),
+            start_session(LOCKING_SP, "0000000900030001", "userpin"),
+            method_record("Set", "0000080200030001", "Locking", "SUCCESS", optional={"Values": [{"7": 1}]}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_datastore_row_values_are_invalid_for_byte_table_set(self):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP, ADMIN1, "new"),
@@ -2347,6 +3285,54 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "PASS")
 
+    def test_delete_sp_requires_admins(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP),
+            method_record("DeleteSP", "0000000000000001", "ThisSP", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_delete_sp_requires_read_write_session(self):
+        readonly_start = start_session(LOCKING_SP, ADMIN1, "new")
+        readonly_start["input"]["method"]["args"]["required"]["Write"] = 0
+        trajectory = activated_locking_context() + [
+            readonly_start,
+            method_record("DeleteSP", "0000000000000001", "ThisSP", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_delete_sp_allows_disabled_sp_with_admins(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000000200000001", "SPInfo", "SUCCESS", optional={"Enabled": False}),
+            method_record("DeleteSP", "0000000000000001", "ThisSP", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_delete_sp_takes_effect_after_successful_close(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("DeleteSP", "0000000000000001", "ThisSP", "SUCCESS"),
+            end_session(),
+            start_session(LOCKING_SP, ADMIN1, "new", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_delete_sp_does_not_take_effect_before_close(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("DeleteSP", "0000000000000001", "ThisSP", "SUCCESS"),
+            method_record("Get", "0000080100000000", "LockingInfo", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_admin_sp_delete_sp_rejects_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("DeleteSP", "0000000000000001", "ThisSP", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_admin_sp_accepts_admin_only_table_row_get(self):
         trajectory = owned_admin_context() + [
             start_session(ADMIN_SP, SID, "new"),
@@ -2445,6 +3431,13 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_ace_row_set_accepts_common_name(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000000800038001", "ACE", "SUCCESS", optional={"CommonName": "ace-alias"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
     def test_authority_get_common_name_allows_anybody(self):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP),
@@ -2493,6 +3486,13 @@ class SolverRuleTests(unittest.TestCase):
             method_record("Set", "0000080200030001", "Locking", "SUCCESS", optional={"Name": "BandX"}),
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_locking_set_accepts_common_name(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Set", "0000080200030001", "Locking", "SUCCESS", optional={"CommonName": "BandAlias"}),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
 
     def test_mbrcontrol_set_rejects_uid_column_success(self):
         trajectory = activated_locking_context() + [
@@ -2702,6 +3702,27 @@ class SolverRuleTests(unittest.TestCase):
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
+    def test_delete_accepts_locking_range_object(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Delete", "0000080200030001", "Locking", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_delete_rejects_global_range_success(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Delete", "0000080200000001", "Locking", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_delete_requires_admins(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP),
+            method_record("Delete", "0000080200030001", "Locking", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
     def test_active_reencrypt_blocks_range_geometry_set_success(self):
         trajectory = activated_locking_context() + [
             start_session(LOCKING_SP, ADMIN1, "new"),
@@ -2782,6 +3803,14 @@ class SolverRuleTests(unittest.TestCase):
                 "SUCCESS",
                 required={"Rows": ["Band1"]},
             ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_active_reencrypt_blocks_locking_delete_success(self):
+        trajectory = activated_locking_context() + [
+            start_session(LOCKING_SP, ADMIN1, "new"),
+            method_record("Get", "0000080200030001", "Locking", return_values=[[{"12": 3}]]),
+            method_record("Delete", "0000080200030001", "Locking", "SUCCESS"),
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
@@ -2990,6 +4019,53 @@ class SolverRuleTests(unittest.TestCase):
                 "SUCCESS",
                 required={"InvokingID": "DataStore", "MethodID": "GetFreeSpace"},
             ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_getacl_accepts_thissp_get_free_space_association(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP),
+            method_record(
+                "GetACL",
+                "0000000700000000",
+                "AccessControl",
+                "SUCCESS",
+                required={"InvokingID": "ThisSP", "MethodID": "GetFreeSpace"},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_delete_method_accepts_known_association(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "DeleteMethod",
+                "0000000700000000",
+                "AccessControl",
+                "SUCCESS",
+                required={"InvokingID": "C_PIN_SID", "MethodID": "Get"},
+            ),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "PASS")
+
+    def test_delete_method_rejects_missing_args_success(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record("DeleteMethod", "0000000700000000", "AccessControl", "SUCCESS"),
+        ]
+        self.assertEqual(predict_trajectory(trajectory), "FAIL")
+
+    def test_deleted_method_association_blocks_later_invocation(self):
+        trajectory = owned_admin_context() + [
+            start_session(ADMIN_SP, SID, "new"),
+            method_record(
+                "DeleteMethod",
+                "0000000700000000",
+                "AccessControl",
+                "SUCCESS",
+                required={"InvokingID": "C_PIN_SID", "MethodID": "Get"},
+            ),
+            method_record("Get", "0000000B00000001", "C_PIN", "SUCCESS", required={"Cellblock": [{"startColumn": 2, "endColumn": 2}]}),
         ]
         self.assertEqual(predict_trajectory(trajectory), "FAIL")
 
